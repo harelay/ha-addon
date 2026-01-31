@@ -589,7 +589,7 @@ class TunnelClient:
                 if self.supervisor_token and not uri.startswith('/auth/') and not is_hassio:
                     filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
-                async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=25), allow_redirects=False) as resp:
+                async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
                     status_code = resp.status
                     response_bytes = await resp.read()
                     response_headers = dict(resp.headers)
