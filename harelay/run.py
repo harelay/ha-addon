@@ -201,16 +201,21 @@ STATUS_HTML = '''<!DOCTYPE html>
 </html>'''
 
 
+CREDENTIALS_FILE = Path('/data/credentials.json')
+
+
 class HARelayAddon:
     """Main add-on class handling both web UI and tunnel."""
 
     def __init__(self, config: dict):
         self.config = config
-        self.subdomain = config.get('subdomain', '').strip()
-        self.token = config.get('connection_token', '').strip()
         self.server_url = 'https://harelay.com'
-
         self.supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
+
+        # Load credentials from file (not from options - keeps them hidden from UI)
+        credentials = self._load_credentials()
+        self.subdomain = credentials.get('subdomain', '').strip()
+        self.token = credentials.get('connection_token', '').strip()
 
         # State
         self.status = 'initializing'
@@ -222,6 +227,28 @@ class HARelayAddon:
 
         logger.info(f'Server URL: {self.server_url}')
         logger.info(f'Configured: {self.is_configured}')
+
+    def _load_credentials(self) -> dict:
+        """Load credentials from file."""
+        if CREDENTIALS_FILE.exists():
+            try:
+                return json.loads(CREDENTIALS_FILE.read_text())
+            except Exception as e:
+                logger.error(f'Failed to load credentials: {e}')
+        return {}
+
+    def _save_credentials(self, subdomain: str, token: str) -> bool:
+        """Save credentials to file."""
+        try:
+            CREDENTIALS_FILE.write_text(json.dumps({
+                'subdomain': subdomain,
+                'connection_token': token
+            }))
+            logger.info('Credentials saved')
+            return True
+        except Exception as e:
+            logger.error(f'Failed to save credentials: {e}')
+            return False
 
     @property
     def is_configured(self) -> bool:
@@ -292,7 +319,7 @@ class HARelayAddon:
 
     async def handle_api_relink(self, request: web.Request) -> web.Response:
         """Reset credentials and start re-pairing."""
-        await self.save_credentials('', '')
+        self._save_credentials('', '')
         self.subdomain = ''
         self.token = ''
         self.status = 'pairing'
@@ -310,24 +337,57 @@ class HARelayAddon:
 
         try:
             async with aiohttp.ClientSession() as session:
-                # Request device code
-                try:
-                    async with session.post(
-                        f'{self.server_url}/api/device/code',
-                        json={'device_name': 'Home Assistant'},
-                        timeout=aiohttp.ClientTimeout(total=15),
-                        allow_redirects=True
-                    ) as resp:
-                        if resp.status != 200:
-                            logger.error(f'Failed to get device code: HTTP {resp.status}')
-                            self.status = 'error'
-                            self.status_message = f'Server returned {resp.status}'
-                            return
-                        data = await resp.json()
-                except aiohttp.ClientError as e:
-                    logger.error(f'Failed to connect: {e}')
+                # Request device code with retry for rate limiting
+                data = None
+                retry_delay = 5  # Start with 5 seconds
+                max_retries = 10
+
+                for attempt in range(max_retries):
+                    if not self.running:
+                        return
+
+                    try:
+                        async with session.post(
+                            f'{self.server_url}/api/device/code',
+                            json={'device_name': 'Home Assistant'},
+                            timeout=aiohttp.ClientTimeout(total=15),
+                            allow_redirects=True
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                break
+                            elif resp.status == 429:
+                                # Rate limited - check Retry-After header or use backoff
+                                retry_after = resp.headers.get('Retry-After')
+                                if retry_after:
+                                    try:
+                                        retry_delay = int(retry_after)
+                                    except ValueError:
+                                        pass
+                                logger.warning(f'Rate limited, retrying in {retry_delay}s...')
+                                await asyncio.sleep(retry_delay)
+                                retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60s
+                                continue
+                            else:
+                                logger.error(f'Failed to get device code: HTTP {resp.status}')
+                                self.status = 'error'
+                                self.status_message = f'Server returned {resp.status}'
+                                return
+                    except aiohttp.ClientError as e:
+                        logger.error(f'Failed to connect: {e}')
+                        if attempt < max_retries - 1:
+                            logger.info(f'Retrying in {retry_delay}s...')
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 2, 60)
+                            continue
+                        self.status = 'error'
+                        self.status_message = f'Cannot reach {self.server_url}'
+                        return
+
+                if not data:
+                    logger.error('Failed to get device code after max retries')
                     self.status = 'error'
-                    self.status_message = f'Cannot reach {self.server_url}'
+                    self.status_message = 'Rate limit exceeded, please try again later'
                     return
 
                 self.device_code = data['device_code']
@@ -357,7 +417,7 @@ class HARelayAddon:
                             logger.info('Pairing successful!')
                             self.subdomain = data['subdomain']
                             self.token = data['token']
-                            await self.save_credentials(self.subdomain, self.token)
+                            self._save_credentials(self.subdomain, self.token)
                             self.status = 'connecting'
                             asyncio.create_task(self.run_tunnel())
                             return
@@ -374,40 +434,6 @@ class HARelayAddon:
             logger.error(f'Pairing error: {e}')
             self.status = 'error'
             self.status_message = str(e)
-
-    async def save_credentials(self, subdomain: str, token: str) -> bool:
-        """Save credentials to Home Assistant add-on config."""
-        if not self.supervisor_token:
-            logger.warning('No SUPERVISOR_TOKEN')
-            return False
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    'http://supervisor/addons/self/options/config',
-                    headers={'Authorization': f'Bearer {self.supervisor_token}'},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    current = await resp.json() if resp.status == 200 else {}
-
-                options = current.get('data', {})
-                options['subdomain'] = subdomain
-                options['connection_token'] = token
-
-                async with session.post(
-                    'http://supervisor/addons/self/options',
-                    json={'options': options},
-                    headers={'Authorization': f'Bearer {self.supervisor_token}'},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info('Credentials saved')
-                        return True
-                    logger.error(f'Save failed: {resp.status}')
-                    return False
-        except Exception as e:
-            logger.error(f'Save error: {e}')
-            return False
 
     # ==================== Tunnel ====================
 
