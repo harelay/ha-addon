@@ -47,16 +47,13 @@ ha-addon/
 |--------|-------------|------------|
 | **HARelay Tunnel** | Secure remote access | `https://harelay.com` |
 
-## Configuration Options
+## Configuration
 
-These are set automatically during pairing, but can be manually configured:
+No configuration needed! Just start the add-on and follow the pairing instructions.
 
+**Optional setting:**
 | Option | Description | Default |
 |--------|-------------|---------|
-| `subdomain` | Your HARelay subdomain | (set via pairing) |
-| `connection_token` | Authentication token | (set via pairing) |
-| `server_url` | HARelay server URL | `https://harelay.com` |
-| `heartbeat_interval` | Seconds between heartbeats | `30` |
 | `log_level` | Logging verbosity | `info` |
 
 ## How It Works

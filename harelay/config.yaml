@@ -1,6 +1,6 @@
 name: "HARelay"
 description: "Secure remote access to Home Assistant via HARelay"
-version: "1.0.0"
+version: "1.1.0"
 slug: "harelay"
 url: "https://harelay.com"
 
@@ -26,15 +26,7 @@ panel_title: "HARelay"
 options:
   subdomain: ""
   connection_token: ""
-  server_url: "https://harelay.com"
-  tunnel_port: 8081
-  heartbeat_interval: 30
   log_level: "info"
 
 schema:
-  subdomain: str?
-  connection_token: str?
-  server_url: url
-  tunnel_port: "int(80,65535)"
-  heartbeat_interval: "int(10,120)"
   log_level: "list(debug|info|warning|error)"

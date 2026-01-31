@@ -208,9 +208,7 @@ class HARelayAddon:
         self.config = config
         self.subdomain = config.get('subdomain', '').strip()
         self.token = config.get('connection_token', '').strip()
-        self.server_url = config.get('server_url', 'https://harelay.com').rstrip('/')
-        self.heartbeat_interval = config.get('heartbeat_interval', 30)
-        self.tunnel_port = config.get('tunnel_port', 8081)
+        self.server_url = 'https://harelay.com'
 
         self.supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
 
@@ -421,9 +419,6 @@ class HARelayAddon:
             tunnel = TunnelClient(
                 subdomain=self.subdomain,
                 token=self.token,
-                server_url=self.server_url,
-                heartbeat_interval=self.heartbeat_interval,
-                tunnel_port=self.tunnel_port,
                 supervisor_token=self.supervisor_token
             )
 
@@ -479,13 +474,9 @@ class HARelayAddon:
 class TunnelClient:
     """WebSocket tunnel client."""
 
-    def __init__(self, subdomain: str, token: str, server_url: str,
-                 heartbeat_interval: int, tunnel_port: int = 8081, supervisor_token: str = None):
+    def __init__(self, subdomain: str, token: str, supervisor_token: str = None):
         self.subdomain = subdomain
         self.token = token
-        self.server_url = server_url.rstrip('/')
-        self.heartbeat_interval = heartbeat_interval
-        self.tunnel_port = tunnel_port
         self.supervisor_token = supervisor_token
         self.ws = None
         self.running = True
@@ -494,17 +485,8 @@ class TunnelClient:
         self.last_error = None
 
     def get_ws_url(self) -> str:
-        parsed = urlparse(self.server_url)
-        # Use /tunnel path through Nginx proxy
-        # Local dev with port uses direct connection to tunnel_port
-        if parsed.port and parsed.port not in (80, 443):
-            # Local development (e.g., http://192.168.1.100:8000)
-            ws_scheme = 'wss' if parsed.scheme == 'https' else 'ws'
-            return f'{ws_scheme}://{parsed.hostname}:{self.tunnel_port}'
-        else:
-            # Production - use /tunnel path through Nginx
-            ws_scheme = 'wss' if parsed.scheme == 'https' else 'ws'
-            return f'{ws_scheme}://{parsed.hostname}/tunnel'
+        """Get WebSocket URL for tunnel connection."""
+        return 'wss://harelay.com/tunnel'
 
     async def connect(self) -> bool:
         ws_url = self.get_ws_url()
@@ -552,7 +534,7 @@ class TunnelClient:
         while self.running and self.ws:
             try:
                 await self.send({'type': 'heartbeat'})
-                await asyncio.sleep(self.heartbeat_interval)
+                await asyncio.sleep(30)  # Heartbeat every 30 seconds
             except Exception:
                 break
 
