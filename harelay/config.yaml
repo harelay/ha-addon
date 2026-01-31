@@ -1,6 +1,6 @@
 name: "HARelay"
 description: "Secure remote access to Home Assistant via HARelay"
-version: "1.2.1"
+version: "1.2.2"
 slug: "harelay"
 url: "https://harelay.com"
 
@@ -29,4 +29,6 @@ options:
   log_level: "info"
 
 schema:
+  subdomain: "str?"
+  connection_token: "str?"
   log_level: "list(debug|info|warning|error)"
