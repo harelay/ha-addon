@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HARelay - Device Pairing</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #fff;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        h1 { font-size: 24px; margin-bottom: 10px; }
+        .subtitle { color: rgba(255,255,255,0.7); margin-bottom: 30px; }
+        .code-box {
+            background: rgba(0,0,0,0.3);
+            border: 2px solid #03dac6;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .code-label { font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #03dac6; margin-bottom: 10px; }
+        .code { font-family: monospace; font-size: 36px; font-weight: bold; letter-spacing: 4px; }
+        .steps { text-align: left; margin: 30px 0; }
+        .step { display: flex; align-items: flex-start; margin-bottom: 15px; }
+        .step-number { background: #03dac6; color: #1a1a2e; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 15px; flex-shrink: 0; }
+        .step-text a { color: #03dac6; }
+        .status { display: flex; align-items: center; justify-content: center; margin-top: 20px; color: rgba(255,255,255,0.7); }
+        .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #03dac6; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 10px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .timer { color: rgba(255,255,255,0.5); font-size: 14px; margin-top: 20px; }
+        .btn { background: #03dac6; color: #1a1a2e; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 15px; }
+        .error { background: rgba(255,82,82,0.2); border: 1px solid #ff5252; border-radius: 8px; padding: 15px; margin-top: 20px; color: #ff8a80; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Link Your Home Assistant</h1>
+        <p class="subtitle">Connect HARelay to access your home remotely</p>
+        <div class="code-box">
+            <div class="code-label">Your Pairing Code</div>
+            <div class="code" id="code">{{USER_CODE}}</div>
+        </div>
+        <div class="steps">
+            <div class="step"><div class="step-number">1</div><div class="step-text">Visit <a href="{{VERIFICATION_URL}}" target="_blank">{{VERIFICATION_URL}}</a></div></div>
+            <div class="step"><div class="step-number">2</div><div class="step-text">Log in or create a free account</div></div>
+            <div class="step"><div class="step-number">3</div><div class="step-text">Enter the pairing code above</div></div>
+        </div>
+        <div class="status"><div class="spinner"></div><span>Waiting for pairing...</span></div>
+        <div class="timer">Code expires in <span id="minutes">15</span> minutes</div>
+        <div id="error" class="error"><strong>Pairing failed.</strong> The code may have expired.<br><button class="btn" onclick="location.reload()">Get New Code</button></div>
+    </div>
+    <script>
+        let expiresAt = Date.now() + {{EXPIRES_IN}} * 1000;
+        function updateTimer() {
+            const remaining = Math.max(0, expiresAt - Date.now());
+            const minutes = Math.floor(remaining / 60000);
+            const seconds = Math.floor((remaining % 60000) / 1000);
+            document.getElementById('minutes').textContent = minutes > 0 ? minutes + ':' + seconds.toString().padStart(2, '0') : seconds + 's';
+            if (remaining <= 0) { document.getElementById('error').style.display = 'block'; document.querySelector('.status').style.display = 'none'; }
+        }
+        function checkStatus() {
+            fetch('api/status').then(r => r.json()).then(data => {
+                if (data.status === 'connected' || data.status === 'connecting') location.reload();
+                else if (data.status === 'expired' || data.status === 'error') { document.getElementById('error').style.display = 'block'; document.querySelector('.status').style.display = 'none'; }
+            }).catch(() => {});
+        }
+        setInterval(updateTimer, 1000);
+        setInterval(checkStatus, 3000);
+        updateTimer();
+    </script>
+</body>
+</html>

@@ -39,166 +39,22 @@ logger = logging.getLogger(__name__)
 HA_HTTP_URL = 'http://localhost:8123'
 HA_WS_URL = 'ws://localhost:8123'
 
-# Embedded templates (fallback if files not found)
-PAIRING_HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HARelay - Device Pairing</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-            color: #fff;
-        }
-        .container {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 500px;
-            width: 100%;
-            text-align: center;
-        }
-        h1 { font-size: 24px; margin-bottom: 10px; }
-        .subtitle { color: rgba(255,255,255,0.7); margin-bottom: 30px; }
-        .code-box {
-            background: rgba(0,0,0,0.3);
-            border: 2px solid #03dac6;
-            border-radius: 12px;
-            padding: 20px;
-            margin: 20px 0;
-        }
-        .code-label { font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #03dac6; margin-bottom: 10px; }
-        .code { font-family: monospace; font-size: 36px; font-weight: bold; letter-spacing: 4px; }
-        .steps { text-align: left; margin: 30px 0; }
-        .step { display: flex; align-items: flex-start; margin-bottom: 15px; }
-        .step-number { background: #03dac6; color: #1a1a2e; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 15px; flex-shrink: 0; }
-        .step-text a { color: #03dac6; }
-        .status { display: flex; align-items: center; justify-content: center; margin-top: 20px; color: rgba(255,255,255,0.7); }
-        .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #03dac6; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 10px; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .timer { color: rgba(255,255,255,0.5); font-size: 14px; margin-top: 20px; }
-        .btn { background: #03dac6; color: #1a1a2e; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 15px; }
-        .error { background: rgba(255,82,82,0.2); border: 1px solid #ff5252; border-radius: 8px; padding: 15px; margin-top: 20px; color: #ff8a80; display: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Link Your Home Assistant</h1>
-        <p class="subtitle">Connect HARelay to access your home remotely</p>
-        <div class="code-box">
-            <div class="code-label">Your Pairing Code</div>
-            <div class="code" id="code">{{USER_CODE}}</div>
-        </div>
-        <div class="steps">
-            <div class="step"><div class="step-number">1</div><div class="step-text">Visit <a href="{{VERIFICATION_URL}}" target="_blank">{{VERIFICATION_URL}}</a></div></div>
-            <div class="step"><div class="step-number">2</div><div class="step-text">Log in or create a free account</div></div>
-            <div class="step"><div class="step-number">3</div><div class="step-text">Enter the pairing code above</div></div>
-        </div>
-        <div class="status"><div class="spinner"></div><span>Waiting for pairing...</span></div>
-        <div class="timer">Code expires in <span id="minutes">15</span> minutes</div>
-        <div id="error" class="error"><strong>Pairing failed.</strong> The code may have expired.<br><button class="btn" onclick="location.reload()">Get New Code</button></div>
-    </div>
-    <script>
-        let expiresAt = Date.now() + {{EXPIRES_IN}} * 1000;
-        function updateTimer() {
-            const remaining = Math.max(0, expiresAt - Date.now());
-            const minutes = Math.floor(remaining / 60000);
-            const seconds = Math.floor((remaining % 60000) / 1000);
-            document.getElementById('minutes').textContent = minutes > 0 ? minutes + ':' + seconds.toString().padStart(2, '0') : seconds + 's';
-            if (remaining <= 0) { document.getElementById('error').style.display = 'block'; document.querySelector('.status').style.display = 'none'; }
-        }
-        function checkStatus() {
-            fetch('api/status').then(r => r.json()).then(data => {
-                if (data.status === 'connected' || data.status === 'connecting') location.reload();
-                else if (data.status === 'expired' || data.status === 'error') { document.getElementById('error').style.display = 'block'; document.querySelector('.status').style.display = 'none'; }
-            }).catch(() => {});
-        }
-        setInterval(updateTimer, 1000);
-        setInterval(checkStatus, 3000);
-        updateTimer();
-    </script>
-</body>
-</html>'''
+# Template directory
+TEMPLATE_DIR = Path(__file__).parent / 'templates'
 
-STATUS_HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HARelay - Status</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-            color: #fff;
-        }
-        .container { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 40px; max-width: 500px; width: 100%; text-align: center; }
-        .status-icon { width: 100px; height: 100px; margin: 0 auto 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 50px; }
-        .status-icon.connected { background: linear-gradient(135deg, #00c853, #00e676); }
-        .status-icon.disconnected { background: linear-gradient(135deg, #ff5252, #ff8a80); }
-        .status-icon.connecting { background: linear-gradient(135deg, #ffc107, #ffca28); }
-        h1 { font-size: 28px; margin-bottom: 10px; }
-        .subtitle { color: rgba(255,255,255,0.7); margin-bottom: 30px; }
-        .info-box { background: rgba(0,0,0,0.3); border-radius: 12px; padding: 20px; margin: 20px 0; text-align: left; }
-        .info-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
-        .info-row:last-child { border-bottom: none; }
-        .info-label { color: rgba(255,255,255,0.6); }
-        .info-value a { color: #03dac6; text-decoration: none; }
-        .btn { background: transparent; color: #ff8a80; border: 1px solid #ff8a80; padding: 12px 24px; border-radius: 8px; font-size: 14px; cursor: pointer; margin-top: 20px; }
-        .btn-primary { background: #03dac6; color: #1a1a2e; border: none; margin-left: 10px; }
-        .pulse { animation: pulse 2s ease-in-out infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="status-icon {{STATUS_CLASS}}" id="statusIcon"><span id="statusEmoji">{{STATUS_EMOJI}}</span></div>
-        <h1 id="statusTitle">{{STATUS_TITLE}}</h1>
-        <p class="subtitle" id="statusSubtitle">{{STATUS_SUBTITLE}}</p>
-        <div class="info-box">
-            <div class="info-row"><span class="info-label">Subdomain</span><span class="info-value">{{SUBDOMAIN}}</span></div>
-            <div class="info-row"><span class="info-label">Remote URL</span><span class="info-value"><a href="https://{{SUBDOMAIN}}.harelay.com" target="_blank">{{SUBDOMAIN}}.harelay.com</a></span></div>
-            <div class="info-row"><span class="info-label">Server</span><span class="info-value">{{SERVER_URL}}</span></div>
-        </div>
-        <div>
-            <button class="btn" onclick="relink()">Relink Device</button>
-            <a href="https://{{SUBDOMAIN}}.harelay.com" target="_blank" class="btn btn-primary">Open Remote Access</a>
-        </div>
-    </div>
-    <script>
-        function relink() {
-            if (confirm('This will unlink your device. Continue?')) {
-                fetch('api/relink', { method: 'POST' }).then(() => setTimeout(() => location.reload(), 1000));
-            }
-        }
-        function updateStatus() {
-            fetch('api/status').then(r => r.json()).then(data => {
-                document.getElementById('statusIcon').className = 'status-icon ' + data.status_class;
-                document.getElementById('statusEmoji').textContent = data.emoji;
-                document.getElementById('statusTitle').textContent = data.title;
-                document.getElementById('statusSubtitle').textContent = data.subtitle;
-                if (data.status === 'pairing') location.reload();
-            }).catch(() => {});
-        }
-        setInterval(updateStatus, 5000);
-    </script>
-</body>
-</html>'''
+# Template cache
+_template_cache: dict[str, str] = {}
+
+def load_template(name: str) -> str:
+    """Load a template from file. Caches templates for performance."""
+    if name not in _template_cache:
+        template_path = TEMPLATE_DIR / f'{name}.html'
+        try:
+            _template_cache[name] = template_path.read_text()
+        except Exception as e:
+            logger.error(f'Failed to load template {name}: {e}')
+            _template_cache[name] = f'<html><body><h1>Error</h1><p>Template {name} not found</p></body></html>'
+    return _template_cache[name]
 
 
 CREDENTIALS_FILE = Path('/data/credentials.json')
@@ -259,8 +115,12 @@ class HARelayAddon:
     async def handle_index(self, request: web.Request) -> web.Response:
         """Main page - show pairing or status."""
         if not self.is_configured:
-            if self.status not in ('pairing', 'error'):
+            # Don't auto-start pairing if user manually unlinked
+            if self.status not in ('pairing', 'error', 'unlinked'):
                 asyncio.create_task(self.start_pairing())
+            # Show unlinked page if manually unlinked
+            if self.status == 'unlinked':
+                return await self.handle_unlinked_page(request)
             return await self.handle_pairing_page(request)
         return await self.handle_status_page(request)
 
@@ -274,11 +134,16 @@ class HARelayAddon:
 
         expires_in = max(0, int(self.code_expires_at - time.time()))
 
-        html = PAIRING_HTML
+        html = load_template('pairing')
         html = html.replace('{{USER_CODE}}', self.user_code or 'Loading...')
         html = html.replace('{{VERIFICATION_URL}}', f'{self.server_url}/link')
         html = html.replace('{{EXPIRES_IN}}', str(expires_in))
 
+        return web.Response(text=html, content_type='text/html')
+
+    async def handle_unlinked_page(self, request: web.Request) -> web.Response:
+        """Show unlinked page with option to start pairing."""
+        html = load_template('unlinked')
         return web.Response(text=html, content_type='text/html')
 
     async def handle_status_page(self, request: web.Request) -> web.Response:
@@ -289,11 +154,14 @@ class HARelayAddon:
         elif self.status == 'connecting':
             status_class, emoji, title = 'connecting pulse', '⟳', 'Connecting...'
             subtitle = 'Establishing tunnel connection'
+        elif self.status == 'initializing':
+            status_class, emoji, title = 'initializing spin', '⟳', 'Starting...'
+            subtitle = 'Initializing add-on, please wait'
         else:
             status_class, emoji, title = 'disconnected', '✗', 'Disconnected'
             subtitle = self.status_message or 'Tunnel is not connected'
 
-        html = STATUS_HTML
+        html = load_template('status')
         html = html.replace('{{STATUS_CLASS}}', status_class)
         html = html.replace('{{STATUS_EMOJI}}', emoji)
         html = html.replace('{{STATUS_TITLE}}', title)
@@ -309,13 +177,27 @@ class HARelayAddon:
             data = {'status': 'connected', 'status_class': 'connected', 'emoji': '✓', 'title': 'Connected', 'subtitle': 'Your Home Assistant is accessible remotely'}
         elif self.status == 'connecting':
             data = {'status': 'connecting', 'status_class': 'connecting pulse', 'emoji': '⟳', 'title': 'Connecting...', 'subtitle': 'Establishing tunnel connection'}
+        elif self.status == 'initializing':
+            data = {'status': 'initializing', 'status_class': 'initializing spin', 'emoji': '⟳', 'title': 'Starting...', 'subtitle': 'Initializing add-on, please wait'}
         elif self.status == 'pairing':
             data = {'status': 'pairing'}
         elif self.status == 'expired':
             data = {'status': 'expired'}
+        elif self.status == 'unlinked':
+            data = {'status': 'unlinked'}
         else:
             data = {'status': 'disconnected', 'status_class': 'disconnected', 'emoji': '✗', 'title': 'Disconnected', 'subtitle': self.status_message or 'Tunnel is not connected'}
         return web.json_response(data)
+
+    async def handle_api_unlink(self, request: web.Request) -> web.Response:
+        """Clear credentials without starting re-pairing."""
+        self._save_credentials('', '')
+        self.subdomain = ''
+        self.token = ''
+        self.status = 'unlinked'
+        self.user_code = None
+        self.status_message = 'Device unlinked. Restart the add-on or click Relink to pair again.'
+        return web.json_response({'ok': True})
 
     async def handle_api_relink(self, request: web.Request) -> web.Response:
         """Reset credentials and start re-pairing."""
@@ -471,6 +353,7 @@ class HARelayAddon:
         app = web.Application()
         app.router.add_get('/', self.handle_index)
         app.router.add_get('/api/status', self.handle_api_status)
+        app.router.add_post('/api/unlink', self.handle_api_unlink)
         app.router.add_post('/api/relink', self.handle_api_relink)
 
         runner = web.AppRunner(app)

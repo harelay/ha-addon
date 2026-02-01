@@ -11,6 +11,7 @@ RUN apk add --no-cache \
 # Copy application
 COPY rootfs /
 COPY run.py /app/run.py
+COPY templates /app/templates
 
 # Set working directory
 WORKDIR /app

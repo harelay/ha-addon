@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HARelay - Status</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #fff;
+        }
+        .container { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 40px; max-width: 500px; width: 100%; text-align: center; }
+        .status-icon { width: 100px; height: 100px; margin: 0 auto 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 50px; }
+        .status-icon.connected { background: linear-gradient(135deg, #00c853, #00e676); }
+        .status-icon.disconnected { background: linear-gradient(135deg, #ff5252, #ff8a80); }
+        .status-icon.connecting { background: linear-gradient(135deg, #ffc107, #ffca28); }
+        .status-icon.initializing { background: linear-gradient(135deg, #2196f3, #64b5f6); }
+        h1 { font-size: 28px; margin-bottom: 10px; }
+        .subtitle { color: rgba(255,255,255,0.7); margin-bottom: 30px; }
+        .info-box { background: rgba(0,0,0,0.3); border-radius: 12px; padding: 20px; margin: 20px 0; text-align: left; }
+        .info-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: rgba(255,255,255,0.6); }
+        .info-value a { color: #03dac6; text-decoration: none; }
+        .btn { background: transparent; color: #ff8a80; border: 1px solid #ff8a80; padding: 12px 24px; border-radius: 8px; font-size: 14px; cursor: pointer; margin-top: 20px; }
+        .btn-primary { background: #03dac6; color: #1a1a2e; border: none; margin-left: 10px; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .pulse { animation: pulse 2s ease-in-out infinite; }
+        .spin { animation: spin 1s linear infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .button-group { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 20px; }
+        .button-group .btn { margin-top: 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="status-icon {{STATUS_CLASS}}" id="statusIcon"><span id="statusEmoji">{{STATUS_EMOJI}}</span></div>
+        <h1 id="statusTitle">{{STATUS_TITLE}}</h1>
+        <p class="subtitle" id="statusSubtitle">{{STATUS_SUBTITLE}}</p>
+        <div class="info-box">
+            <div class="info-row"><span class="info-label">Subdomain</span><span class="info-value">{{SUBDOMAIN}}</span></div>
+            <div class="info-row"><span class="info-label">Remote URL</span><span class="info-value"><a href="https://{{SUBDOMAIN}}.harelay.com" target="_blank">{{SUBDOMAIN}}.harelay.com</a></span></div>
+            <div class="info-row"><span class="info-label">Server</span><span class="info-value">{{SERVER_URL}}</span></div>
+        </div>
+        <div class="button-group">
+            <button class="btn" id="unlinkBtn" onclick="unlink()">Unlink</button>
+            <button class="btn" id="relinkBtn" onclick="relink()">Relink</button>
+            <a href="https://{{SUBDOMAIN}}.harelay.com" target="_blank" class="btn btn-primary" id="openBtn">Open Remote Access</a>
+        </div>
+    </div>
+    <script>
+        function unlink() {
+            if (confirm('This will unlink your device and clear saved credentials. You will need to pair again. Continue?')) {
+                document.getElementById('unlinkBtn').disabled = true;
+                document.getElementById('unlinkBtn').textContent = 'Unlinking...';
+                fetch('api/unlink', { method: 'POST' }).then(() => setTimeout(() => location.reload(), 1000));
+            }
+        }
+        function relink() {
+            if (confirm('This will unlink your device and start the pairing process again. Continue?')) {
+                document.getElementById('relinkBtn').disabled = true;
+                document.getElementById('relinkBtn').textContent = 'Relinking...';
+                fetch('api/relink', { method: 'POST' }).then(() => setTimeout(() => location.reload(), 1000));
+            }
+        }
+        function updateStatus() {
+            fetch('api/status').then(r => r.json()).then(data => {
+                document.getElementById('statusIcon').className = 'status-icon ' + data.status_class;
+                document.getElementById('statusEmoji').textContent = data.emoji;
+                document.getElementById('statusTitle').textContent = data.title;
+                document.getElementById('statusSubtitle').textContent = data.subtitle;
+                if (data.status === 'pairing' || data.status === 'unlinked') location.reload();
+            }).catch(() => {});
+        }
+        setInterval(updateStatus, 5000);
+    </script>
+</body>
+</html>

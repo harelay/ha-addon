@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HARelay - Unlinked</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #fff;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        .icon { font-size: 60px; margin-bottom: 20px; }
+        h1 { font-size: 24px; margin-bottom: 10px; }
+        .subtitle { color: rgba(255,255,255,0.7); margin-bottom: 30px; }
+        .btn { background: #03dac6; color: #1a1a2e; border: none; padding: 14px 28px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; }
+        .btn:hover { background: #00bfa5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔓</div>
+        <h1>Device Unlinked</h1>
+        <p class="subtitle">Your device has been unlinked from HARelay. Click below to pair again.</p>
+        <button class="btn" onclick="startPairing()">Start Pairing</button>
+    </div>
+    <script>
+        function startPairing() {
+            fetch('api/relink', { method: 'POST' }).then(() => setTimeout(() => location.reload(), 500));
+        }
+    </script>
+</body>
+</html>
