@@ -501,11 +501,22 @@ class TunnelClient:
         try:
             url = urljoin(HA_HTTP_URL, uri)
             # Filter out headers that shouldn't be forwarded
-            skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding', 'authorization'}
+            skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
             filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
             filtered_headers['Accept-Encoding'] = 'identity'
-            # Use Supervisor token for all requests (except auth endpoints which handle their own auth)
-            if self.supervisor_token and not uri.startswith('/auth/'):
+
+            # Handle authorization:
+            # - /api/hassio/* endpoints: preserve user's auth token (required for Supervisor API via HA Core)
+            # - /auth/* endpoints: no auth needed (handles its own)
+            # - Other endpoints: use Supervisor token for add-on authentication
+            original_auth = headers.get('Authorization') or headers.get('authorization')
+            if uri.startswith('/api/hassio/'):
+                # Hassio/Supervisor endpoints require user's HA auth token, not Supervisor token
+                # HA Core needs to verify the USER has permission to access these endpoints
+                if original_auth:
+                    filtered_headers['Authorization'] = original_auth
+            elif not uri.startswith('/auth/') and self.supervisor_token:
+                # Other endpoints use Supervisor token
                 filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
             # Use shared session for connection pooling
