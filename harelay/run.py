@@ -398,6 +398,7 @@ class TunnelClient:
         self.ws_streams = {}
         self.ws_pending = {}
         self.last_error = None
+        self.http_session = None  # Shared HTTP session for connection pooling
 
     def get_ws_url(self) -> str:
         """Get WebSocket URL for tunnel connection."""
@@ -430,6 +431,9 @@ class TunnelClient:
         return json.loads(data)
 
     async def run(self):
+        # Create shared HTTP session for connection pooling (major performance improvement)
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=50, keepalive_timeout=30)
+        self.http_session = aiohttp.ClientSession(connector=connector)
         try:
             await asyncio.gather(self.heartbeat_loop(), self.message_loop(), return_exceptions=True)
         finally:
@@ -444,6 +448,8 @@ class TunnelClient:
                     await self.ws.close()
                 except Exception:
                     pass
+            if self.http_session:
+                await self.http_session.close()
 
     async def heartbeat_loop(self):
         while self.running and self.ws:
@@ -493,20 +499,20 @@ class TunnelClient:
             body = body.encode()
 
         try:
-            async with aiohttp.ClientSession() as session:
-                url = urljoin(HA_HTTP_URL, uri)
-                # Filter out headers that shouldn't be forwarded
-                skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding', 'authorization'}
-                filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
-                filtered_headers['Accept-Encoding'] = 'identity'
-                # Use Supervisor token for all requests (except auth endpoints which handle their own auth)
-                if self.supervisor_token and not uri.startswith('/auth/'):
-                    filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
+            url = urljoin(HA_HTTP_URL, uri)
+            # Filter out headers that shouldn't be forwarded
+            skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding', 'authorization'}
+            filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
+            filtered_headers['Accept-Encoding'] = 'identity'
+            # Use Supervisor token for all requests (except auth endpoints which handle their own auth)
+            if self.supervisor_token and not uri.startswith('/auth/'):
+                filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
-                async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
-                    status_code = resp.status
-                    response_bytes = await resp.read()
-                    response_headers = dict(resp.headers)
+            # Use shared session for connection pooling
+            async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
+                status_code = resp.status
+                response_bytes = await resp.read()
+                response_headers = dict(resp.headers)
         except asyncio.TimeoutError:
             status_code, response_bytes, response_headers = 504, b'Gateway Timeout', {'Content-Type': 'text/plain'}
         except Exception as e:
