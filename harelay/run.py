@@ -487,15 +487,12 @@ class TunnelClient:
         try:
             async with aiohttp.ClientSession() as session:
                 url = urljoin(HA_HTTP_URL, uri)
-                # For /api/hassio/* endpoints, forward the user's token (HA validates user permissions)
-                # For other endpoints, use the Supervisor token
-                is_hassio = uri.startswith('/api/hassio')
-                skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
-                if not is_hassio:
-                    skip_headers.add('authorization')
+                # Filter out headers that shouldn't be forwarded
+                skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding', 'authorization'}
                 filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
                 filtered_headers['Accept-Encoding'] = 'identity'
-                if self.supervisor_token and not uri.startswith('/auth/') and not is_hassio:
+                # Use Supervisor token for all requests (except auth endpoints which handle their own auth)
+                if self.supervisor_token and not uri.startswith('/auth/'):
                     filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
                 async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
