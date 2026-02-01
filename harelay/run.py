@@ -433,7 +433,7 @@ class TunnelClient:
         try:
             await asyncio.gather(self.heartbeat_loop(), self.message_loop(), return_exceptions=True)
         finally:
-            for ws in self.ws_streams.values():
+            for ws in list(self.ws_streams.values()):
                 try:
                     await ws.close()
                 except Exception:
