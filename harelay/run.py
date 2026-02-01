@@ -519,11 +519,35 @@ class TunnelClient:
                     # Fall back to Supervisor token for requests without explicit auth
                     filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
-            # Use shared session for connection pooling
-            async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
-                status_code = resp.status
-                response_bytes = await resp.read()
-                response_headers = dict(resp.headers)
+            # Check if this is a streaming endpoint (like /logs/follow)
+            is_streaming = '/follow' in uri or headers.get('Accept') == 'text/event-stream'
+
+            if is_streaming:
+                # For streaming endpoints, read chunks with a short timeout
+                # This gets available data without waiting forever
+                timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
+                async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
+                    status_code = resp.status
+                    response_headers = dict(resp.headers)
+                    # Read available chunks (up to 1MB or until read timeout)
+                    chunks = []
+                    total_size = 0
+                    max_size = 1024 * 1024  # 1MB limit for streaming snapshots
+                    try:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            chunks.append(chunk)
+                            total_size += len(chunk)
+                            if total_size >= max_size:
+                                break
+                    except asyncio.TimeoutError:
+                        pass  # Expected - we got what's available
+                    response_bytes = b''.join(chunks)
+            else:
+                # Regular request - wait for full response
+                async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
+                    status_code = resp.status
+                    response_bytes = await resp.read()
+                    response_headers = dict(resp.headers)
         except asyncio.TimeoutError:
             status_code, response_bytes, response_headers = 504, b'Gateway Timeout', {'Content-Type': 'text/plain'}
         except Exception as e:
