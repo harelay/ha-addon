@@ -501,9 +501,10 @@ class TunnelClient:
         try:
             url = urljoin(HA_HTTP_URL, uri)
             # Filter out headers that shouldn't be forwarded
+            # Note: We strip accept-encoding to let aiohttp handle compression/decompression automatically
             skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
             filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
-            filtered_headers['Accept-Encoding'] = 'identity'
+            # Don't set Accept-Encoding - let aiohttp use defaults and auto-decompress
 
             # Handle authorization:
             # - /auth/* endpoints: no auth needed (handles its own auth flow)
