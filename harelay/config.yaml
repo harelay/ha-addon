@@ -1,6 +1,6 @@
 name: "HARelay"
 description: "Secure remote access to Home Assistant via HARelay"
-version: "1.2.6"
+version: "1.2.7"
 slug: "harelay"
 url: "https://harelay.com"
 
@@ -16,7 +16,6 @@ arch:
 startup: application
 homeassistant_api: true
 auth_api: true
-watchdog: true
 
 # Enable web UI panel
 ingress: true
