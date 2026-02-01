@@ -506,18 +506,18 @@ class TunnelClient:
             filtered_headers['Accept-Encoding'] = 'identity'
 
             # Handle authorization:
-            # - /api/hassio/* endpoints: preserve user's auth token (required for Supervisor API via HA Core)
-            # - /auth/* endpoints: no auth needed (handles its own)
-            # - Other endpoints: use Supervisor token for add-on authentication
-            original_auth = headers.get('Authorization') or headers.get('authorization')
-            if uri.startswith('/api/hassio/'):
-                # Hassio/Supervisor endpoints require user's HA auth token, not Supervisor token
-                # HA Core needs to verify the USER has permission to access these endpoints
+            # - /auth/* endpoints: no auth needed (handles its own auth flow)
+            # - All other endpoints: preserve user's auth if present, fall back to Supervisor token
+            # This ensures user context is maintained for endpoints that need it (like /api/hassio/*)
+            # while providing a fallback for requests without explicit auth
+            if not uri.startswith('/auth/'):
+                original_auth = headers.get('Authorization') or headers.get('authorization')
                 if original_auth:
+                    # Preserve user's auth token - needed for user-context endpoints like /api/hassio/*
                     filtered_headers['Authorization'] = original_auth
-            elif not uri.startswith('/auth/') and self.supervisor_token:
-                # Other endpoints use Supervisor token
-                filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
+                elif self.supervisor_token:
+                    # Fall back to Supervisor token for requests without explicit auth
+                    filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
             # Use shared session for connection pooling
             async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
