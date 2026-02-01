@@ -319,6 +319,10 @@ class HARelayAddon:
 
     # ==================== Tunnel ====================
 
+    def _on_subdomain_changed(self, new_subdomain: str):
+        """Called when server notifies us of a subdomain change."""
+        self.subdomain = new_subdomain
+
     async def run_tunnel(self):
         """Main tunnel loop with reconnection."""
         self.status = 'connecting'
@@ -327,7 +331,8 @@ class HARelayAddon:
             tunnel = TunnelClient(
                 subdomain=self.subdomain,
                 token=self.token,
-                supervisor_token=self.supervisor_token
+                supervisor_token=self.supervisor_token,
+                on_subdomain_changed=self._on_subdomain_changed
             )
 
             if await tunnel.connect():
@@ -383,10 +388,11 @@ class HARelayAddon:
 class TunnelClient:
     """WebSocket tunnel client."""
 
-    def __init__(self, subdomain: str, token: str, supervisor_token: str = None):
+    def __init__(self, subdomain: str, token: str, supervisor_token: str = None, on_subdomain_changed: callable = None):
         self.subdomain = subdomain
         self.token = token
         self.supervisor_token = supervisor_token
+        self.on_subdomain_changed = on_subdomain_changed
         self.ws = None
         self.running = True
         self.ws_streams = {}
@@ -461,6 +467,8 @@ class TunnelClient:
                     asyncio.create_task(self.handle_ws_message(message))
                 elif msg_type == 'ws_close':
                     asyncio.create_task(self.handle_ws_close(message))
+                elif msg_type == 'subdomain_changed':
+                    self.handle_subdomain_changed(message)
                 elif msg_type == 'error':
                     logger.error(f'Server: {message.get("error")}')
 
@@ -556,6 +564,28 @@ class TunnelClient:
                 await self.ws_streams.pop(stream_id).close()
             except Exception:
                 pass
+
+    def handle_subdomain_changed(self, message: dict):
+        """Handle subdomain change notification from server."""
+        old_subdomain = message.get('old_subdomain')
+        new_subdomain = message.get('new_subdomain')
+        logger.info(f'Subdomain changed: {old_subdomain} -> {new_subdomain}')
+
+        self.subdomain = new_subdomain
+
+        # Update saved credentials
+        try:
+            CREDENTIALS_FILE.write_text(json.dumps({
+                'subdomain': new_subdomain,
+                'connection_token': self.token
+            }))
+            logger.info(f'Credentials updated with new subdomain: {new_subdomain}')
+        except Exception as e:
+            logger.error(f'Failed to save updated credentials: {e}')
+
+        # Notify parent (HARelayAddon) of the change
+        if self.on_subdomain_changed:
+            self.on_subdomain_changed(new_subdomain)
 
 
 def load_config() -> dict:
