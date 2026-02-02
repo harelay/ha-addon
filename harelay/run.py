@@ -440,10 +440,14 @@ class TunnelClient:
         connector = aiohttp.TCPConnector(
             limit=200,              # Total connection pool size
             limit_per_host=100,     # Connections to HA (single host)
-            keepalive_timeout=60,   # Keep connections alive longer
-            enable_cleanup_closed=True
+            keepalive_timeout=30,   # Keep connections alive (shorter = fresher connections)
+            enable_cleanup_closed=True,  # Clean up closed connections
+            force_close=False,      # Enable connection reuse
         )
-        self.http_session = aiohttp.ClientSession(connector=connector)
+        self.http_session = aiohttp.ClientSession(
+            connector=connector,
+            auto_decompress=True,   # Handle gzip automatically
+        )
         self.last_server_response = time.time()  # Reset on new connection
         try:
             results = await asyncio.gather(
@@ -550,63 +554,113 @@ class TunnelClient:
         elif body:
             body = body.encode()
 
-        try:
-            url = urljoin(HA_HTTP_URL, uri)
-            # Filter out headers that shouldn't be forwarded
-            # Note: We strip accept-encoding to let aiohttp handle compression/decompression automatically
-            skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
-            filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
-            # Don't set Accept-Encoding - let aiohttp use defaults and auto-decompress
+        url = urljoin(HA_HTTP_URL, uri)
+        # Filter out headers that shouldn't be forwarded
+        skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
+        filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
 
-            # Handle authorization:
-            # - /auth/* endpoints: no auth needed (handles its own auth flow)
-            # - All other endpoints: preserve user's auth if present, fall back to Supervisor token
-            # This ensures user context is maintained for endpoints that need it (like /api/hassio/*)
-            # while providing a fallback for requests without explicit auth
-            if not uri.startswith('/auth/'):
-                original_auth = headers.get('Authorization') or headers.get('authorization')
-                if original_auth:
-                    # Preserve user's auth token - needed for user-context endpoints like /api/hassio/*
-                    filtered_headers['Authorization'] = original_auth
-                elif self.supervisor_token:
-                    # Fall back to Supervisor token for requests without explicit auth
-                    filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
+        # Handle authorization
+        if not uri.startswith('/auth/'):
+            original_auth = headers.get('Authorization') or headers.get('authorization')
+            if original_auth:
+                filtered_headers['Authorization'] = original_auth
+            elif self.supervisor_token:
+                filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
-            # Check if this is a streaming endpoint (like /logs/follow)
-            is_streaming = '/follow' in uri or headers.get('Accept') == 'text/event-stream'
+        # Check if this is a streaming endpoint (like /logs/follow)
+        is_streaming = '/follow' in uri or headers.get('Accept') == 'text/event-stream'
 
-            if is_streaming:
-                # For streaming endpoints, read chunks with a short timeout
-                # This gets available data without waiting forever
-                timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
-                async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
-                    status_code = resp.status
-                    response_headers = dict(resp.headers)
-                    # Read available chunks (up to 1MB or until read timeout)
-                    chunks = []
-                    total_size = 0
-                    max_size = 1024 * 1024  # 1MB limit for streaming snapshots
-                    try:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            chunks.append(chunk)
-                            total_size += len(chunk)
-                            if total_size >= max_size:
-                                break
-                    except asyncio.TimeoutError:
-                        pass  # Expected - we got what's available
-                    response_bytes = b''.join(chunks)
-            else:
-                # Regular request - wait for full response
-                async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=aiohttp.ClientTimeout(total=55), allow_redirects=False) as resp:
-                    status_code = resp.status
-                    response_bytes = await resp.read()
-                    response_headers = dict(resp.headers)
-        except asyncio.TimeoutError:
-            status_code, response_bytes, response_headers = 504, b'Gateway Timeout', {'Content-Type': 'text/plain'}
-        except Exception as e:
-            status_code, response_bytes, response_headers = 502, f'Bad Gateway: {e}'.encode(), {'Content-Type': 'text/plain'}
+        # Retry logic for connection errors - helps with pooling issues
+        max_retries = 2
+        last_error = None
 
-        await self.send({'type': 'response', 'request_id': request_id, 'status_code': status_code, 'headers': response_headers, 'body': base64.b64encode(response_bytes).decode('ascii')})
+        for attempt in range(max_retries):
+            try:
+                if is_streaming:
+                    # For streaming endpoints, read chunks with a short timeout
+                    timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
+                    async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        response_headers = dict(resp.headers)
+                        chunks = []
+                        total_size = 0
+                        max_size = 1024 * 1024
+                        try:
+                            async for chunk in resp.content.iter_chunked(8192):
+                                chunks.append(chunk)
+                                total_size += len(chunk)
+                                if total_size >= max_size:
+                                    break
+                        except asyncio.TimeoutError:
+                            pass
+                        response_bytes = b''.join(chunks)
+                else:
+                    # Regular request with separate connect/read timeouts
+                    timeout = aiohttp.ClientTimeout(
+                        total=None,
+                        connect=10,
+                        sock_read=55
+                    )
+                    async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        response_bytes = await resp.read()
+                        response_headers = dict(resp.headers)
+
+                        # Validate response integrity - detect corruption
+                        content_length = resp.headers.get('Content-Length')
+                        if content_length:
+                            expected = int(content_length)
+                            actual = len(response_bytes)
+                            if expected != actual:
+                                raise aiohttp.ClientPayloadError(
+                                    f'Content-Length mismatch: expected {expected}, got {actual}'
+                                )
+
+                # Success - send response
+                await self.send({
+                    'type': 'response',
+                    'request_id': request_id,
+                    'status_code': status_code,
+                    'headers': response_headers,
+                    'body': base64.b64encode(response_bytes).decode('ascii')
+                })
+                return
+
+            except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError,
+                    aiohttp.ClientOSError, ConnectionResetError) as e:
+                # Connection-level errors - retry
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(f'Request {uri} failed ({type(e).__name__}), retry {attempt + 1}/{max_retries - 1}')
+                    await asyncio.sleep(0.05)  # Brief pause
+                    continue
+
+            except asyncio.TimeoutError:
+                # Timeouts - don't retry, fail fast
+                status_code = 504
+                response_bytes = b'Gateway Timeout'
+                response_headers = {'Content-Type': 'text/plain'}
+                break
+
+            except Exception as e:
+                # Other errors - don't retry
+                last_error = e
+                break
+
+        # All retries failed or non-retryable error
+        if last_error:
+            logger.error(f'Request {uri} failed after retries: {last_error}')
+            status_code = 502
+            response_bytes = f'Bad Gateway: {type(last_error).__name__}'.encode()
+            response_headers = {'Content-Type': 'text/plain'}
+
+        await self.send({
+            'type': 'response',
+            'request_id': request_id,
+            'status_code': status_code,
+            'headers': response_headers,
+            'body': base64.b64encode(response_bytes).decode('ascii')
+        })
 
     async def handle_ws_open(self, message: dict):
         stream_id = message.get('stream_id')
