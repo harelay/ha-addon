@@ -607,14 +607,18 @@ class TunnelClient:
                         response_headers = dict(resp.headers)
 
                         # Validate response integrity - detect corruption
-                        content_length = resp.headers.get('Content-Length')
-                        if content_length:
-                            expected = int(content_length)
-                            actual = len(response_bytes)
-                            if expected != actual:
-                                raise aiohttp.ClientPayloadError(
-                                    f'Content-Length mismatch: expected {expected}, got {actual}'
-                                )
+                        # Skip if response was compressed (Content-Length is compressed size,
+                        # but body is decompressed by aiohttp)
+                        content_encoding = resp.headers.get('Content-Encoding', '').lower()
+                        if not content_encoding:  # Only validate uncompressed responses
+                            content_length = resp.headers.get('Content-Length')
+                            if content_length:
+                                expected = int(content_length)
+                                actual = len(response_bytes)
+                                if expected != actual:
+                                    raise aiohttp.ClientPayloadError(
+                                        f'Content-Length mismatch: expected {expected}, got {actual}'
+                                    )
 
                 # Success - send response
                 await self.send({
