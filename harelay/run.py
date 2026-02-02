@@ -391,6 +391,10 @@ class TunnelClient:
     # Health check: force reconnect if no server response within this time
     HEALTH_CHECK_TIMEOUT = 60  # seconds
 
+    # Static file cache settings
+    CACHE_MAX_SIZE = 100 * 1024 * 1024  # 100MB max cache size
+    CACHE_PATHS = ('/frontend_latest/', '/static/', '/hacsfiles/')
+
     def __init__(self, subdomain: str, token: str, supervisor_token: str = None, on_subdomain_changed: callable = None):
         self.subdomain = subdomain
         self.token = token
@@ -401,8 +405,10 @@ class TunnelClient:
         self.ws_streams = {}
         self.ws_pending = {}
         self.last_error = None
-        self.http_session = None  # Shared HTTP session for connection pooling
+        self.http_connector = None  # Shared connector, per-request sessions
         self.last_server_response = time.time()  # Track last message from server
+        self.static_cache = {}  # uri -> (status_code, headers, body_bytes)
+        self.static_cache_size = 0  # Track total cache size
 
     def get_ws_url(self) -> str:
         """Get WebSocket URL for tunnel connection."""
@@ -435,18 +441,10 @@ class TunnelClient:
         return json.loads(data)
 
     async def run(self):
-        # Create shared HTTP session with connection pooling for performance
-        # High limits to handle parallel requests during page load
-        connector = aiohttp.TCPConnector(
-            limit=200,              # Total connection pool size
-            limit_per_host=100,     # Connections to HA (single host)
-            keepalive_timeout=30,   # Keep connections alive (shorter = fresher connections)
-            enable_cleanup_closed=True,  # Clean up closed connections
-            force_close=False,      # Enable connection reuse
-        )
-        self.http_session = aiohttp.ClientSession(
-            connector=connector,
-            auto_decompress=False,  # Don't decompress - we validate Content-Length
+        # Shared connector but each request validates its response
+        self.http_connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=100,
         )
         self.last_server_response = time.time()  # Reset on new connection
         try:
@@ -473,8 +471,8 @@ class TunnelClient:
                     await self.ws.close()
                 except Exception:
                     pass
-            if self.http_session:
-                await self.http_session.close()
+            if self.http_connector:
+                await self.http_connector.close()
 
     async def heartbeat_loop(self):
         while self.running and self.ws:
@@ -558,8 +556,6 @@ class TunnelClient:
         # Filter out headers that shouldn't be forwarded
         skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
         filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
-        # Request uncompressed responses so we can validate Content-Length
-        filtered_headers['Accept-Encoding'] = 'identity'
 
         # Handle authorization
         if not uri.startswith('/auth/'):
@@ -572,90 +568,95 @@ class TunnelClient:
         # Check if this is a streaming endpoint (like /logs/follow)
         is_streaming = '/follow' in uri or headers.get('Accept') == 'text/event-stream'
 
-        # Retry logic for connection errors - helps with pooling issues
-        max_retries = 2
+        # Check if this is a cacheable static file
+        is_cacheable = method == 'GET' and any(uri.startswith(p) for p in self.CACHE_PATHS)
+
+        # Check cache first for static files
+        if is_cacheable and uri in self.static_cache:
+            status_code, response_headers, response_bytes = self.static_cache[uri]
+            logger.info(f'REQ CACHE HIT {uri}')
+            await self.send({
+                'type': 'response',
+                'request_id': request_id,
+                'status_code': status_code,
+                'headers': response_headers,
+                'body': base64.b64encode(response_bytes).decode('ascii')
+            })
+            return
+
+        logger.info(f'REQ START {uri}')
+        status_code = None
+        response_bytes = None
+        response_headers = None
         last_error = None
 
-        for attempt in range(max_retries):
+        for attempt in range(2):
             try:
-                if is_streaming:
-                    # For streaming endpoints, read chunks with a short timeout
-                    timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
-                    async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
-                        status_code = resp.status
-                        response_headers = dict(resp.headers)
-                        chunks = []
-                        total_size = 0
-                        max_size = 1024 * 1024
-                        try:
-                            async for chunk in resp.content.iter_chunked(8192):
-                                chunks.append(chunk)
-                                total_size += len(chunk)
-                                if total_size >= max_size:
-                                    break
-                        except asyncio.TimeoutError:
-                            pass
-                        response_bytes = b''.join(chunks)
-                else:
-                    # Regular request with separate connect/read timeouts
-                    timeout = aiohttp.ClientTimeout(
-                        total=None,
-                        connect=10,
-                        sock_read=55
-                    )
-                    async with self.http_session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
-                        status_code = resp.status
-                        response_bytes = await resp.read()
-                        response_headers = dict(resp.headers)
-
-                        # Validate response integrity - detect corruption
-                        content_length = resp.headers.get('Content-Length')
-                        if content_length:
-                            expected = int(content_length)
-                            actual = len(response_bytes)
-                            if expected != actual:
-                                raise aiohttp.ClientPayloadError(
-                                    f'Content-Length mismatch: expected {expected}, got {actual}'
-                                )
-
-                # Success - send response
-                await self.send({
-                    'type': 'response',
-                    'request_id': request_id,
-                    'status_code': status_code,
-                    'headers': response_headers,
-                    'body': base64.b64encode(response_bytes).decode('ascii')
-                })
-                return
+                # Create a fresh session for each request - shares connector but isolates state
+                async with aiohttp.ClientSession(connector=self.http_connector, connector_owner=False) as session:
+                    if is_streaming:
+                        timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
+                        async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
+                            status_code = resp.status
+                            response_headers = dict(resp.headers)
+                            chunks = []
+                            total_size = 0
+                            try:
+                                async for chunk in resp.content.iter_chunked(8192):
+                                    chunks.append(chunk)
+                                    total_size += len(chunk)
+                                    if total_size >= 1024 * 1024:
+                                        break
+                            except asyncio.TimeoutError:
+                                pass
+                            response_bytes = b''.join(chunks)
+                    else:
+                        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=55)
+                        async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
+                            status_code = resp.status
+                            response_bytes = await resp.read()
+                            response_headers = dict(resp.headers)
+                break  # Success
 
             except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError,
                     aiohttp.ClientOSError, ConnectionResetError) as e:
-                # Connection-level errors - retry
                 last_error = e
-                if attempt < max_retries - 1:
-                    logger.warning(f'Request {uri} failed ({type(e).__name__}), retry {attempt + 1}/{max_retries - 1}')
-                    await asyncio.sleep(0.05)  # Brief pause
+                if attempt == 0:
+                    logger.warning(f'Request {uri} failed ({type(e).__name__}), retrying...')
+                    await asyncio.sleep(0.05)
                     continue
 
             except asyncio.TimeoutError:
-                # Timeouts - don't retry, fail fast
                 status_code = 504
                 response_bytes = b'Gateway Timeout'
                 response_headers = {'Content-Type': 'text/plain'}
                 break
 
             except Exception as e:
-                # Other errors - don't retry
                 last_error = e
                 break
 
-        # All retries failed or non-retryable error
         if last_error:
-            logger.error(f'Request {uri} failed after retries: {last_error}')
+            logger.error(f'Request {uri} failed: {last_error}')
             status_code = 502
             response_bytes = f'Bad Gateway: {type(last_error).__name__}'.encode()
             response_headers = {'Content-Type': 'text/plain'}
 
+        # Cache successful static file responses
+        if is_cacheable and status_code == 200 and response_bytes:
+            file_size = len(response_bytes)
+            # Evict old entries if cache is too large
+            while self.static_cache_size + file_size > self.CACHE_MAX_SIZE and self.static_cache:
+                oldest_uri = next(iter(self.static_cache))
+                old_size = len(self.static_cache[oldest_uri][2])
+                del self.static_cache[oldest_uri]
+                self.static_cache_size -= old_size
+            # Add to cache
+            self.static_cache[uri] = (status_code, response_headers, response_bytes)
+            self.static_cache_size += file_size
+            logger.info(f'REQ CACHED {uri} ({file_size} bytes, cache: {self.static_cache_size // 1024}KB)')
+
+        logger.info(f'REQ DONE {uri} -> {status_code}')
         await self.send({
             'type': 'response',
             'request_id': request_id,
@@ -752,7 +753,7 @@ def load_config() -> dict:
 
 
 async def main():
-    logger.info('HARelay Add-on starting...')
+    logger.info('HARelay Add-on starting... (v8-cache)')
     config = load_config()
     logger.info(f'Config loaded: {list(config.keys())}')
 
