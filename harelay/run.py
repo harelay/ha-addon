@@ -435,10 +435,14 @@ class TunnelClient:
         return json.loads(data)
 
     async def run(self):
-        # Create shared HTTP session
-        # Note: Using force_close=True to avoid connection reuse issues that can cause
-        # intermittent failures with dynamic JS imports
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=50, force_close=True)
+        # Create shared HTTP session with connection pooling for performance
+        # High limits to handle parallel requests during page load
+        connector = aiohttp.TCPConnector(
+            limit=200,              # Total connection pool size
+            limit_per_host=100,     # Connections to HA (single host)
+            keepalive_timeout=60,   # Keep connections alive longer
+            enable_cleanup_closed=True
+        )
         self.http_session = aiohttp.ClientSession(connector=connector)
         self.last_server_response = time.time()  # Reset on new connection
         try:
