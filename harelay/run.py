@@ -388,6 +388,9 @@ class HARelayAddon:
 class TunnelClient:
     """WebSocket tunnel client."""
 
+    # Health check: force reconnect if no server response within this time
+    HEALTH_CHECK_TIMEOUT = 60  # seconds
+
     def __init__(self, subdomain: str, token: str, supervisor_token: str = None, on_subdomain_changed: callable = None):
         self.subdomain = subdomain
         self.token = token
@@ -399,6 +402,7 @@ class TunnelClient:
         self.ws_pending = {}
         self.last_error = None
         self.http_session = None  # Shared HTTP session for connection pooling
+        self.last_server_response = time.time()  # Track last message from server
 
     def get_ws_url(self) -> str:
         """Get WebSocket URL for tunnel connection."""
@@ -431,11 +435,24 @@ class TunnelClient:
         return json.loads(data)
 
     async def run(self):
-        # Create shared HTTP session for connection pooling (major performance improvement)
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=50, keepalive_timeout=30)
+        # Create shared HTTP session
+        # Note: Using force_close=True to avoid connection reuse issues that can cause
+        # intermittent failures with dynamic JS imports
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=50, force_close=True)
         self.http_session = aiohttp.ClientSession(connector=connector)
+        self.last_server_response = time.time()  # Reset on new connection
         try:
-            await asyncio.gather(self.heartbeat_loop(), self.message_loop(), return_exceptions=True)
+            results = await asyncio.gather(
+                self.heartbeat_loop(),
+                self.message_loop(),
+                self.health_check_loop(),
+                return_exceptions=True
+            )
+            # Log any exceptions that occurred
+            loop_names = ['heartbeat_loop', 'message_loop', 'health_check_loop']
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f'{loop_names[i]} exited with error: {result}')
         finally:
             for ws in list(self.ws_streams.values()):
                 try:
@@ -456,13 +473,32 @@ class TunnelClient:
             try:
                 await self.send({'type': 'heartbeat'})
                 await asyncio.sleep(30)  # Heartbeat every 30 seconds
-            except Exception:
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f'Heartbeat: connection closed (code={e.code}, reason={e.reason})')
                 break
+            except Exception as e:
+                logger.error(f'Heartbeat error: {e}')
+                break
+        logger.info('Heartbeat loop exited')
+
+    async def health_check_loop(self):
+        """Monitor connection health and force reconnect if server stops responding."""
+        while self.running and self.ws:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            time_since_response = time.time() - self.last_server_response
+            if time_since_response > self.HEALTH_CHECK_TIMEOUT:
+                logger.warning(f'Connection unhealthy: no server response for {time_since_response:.0f}s, forcing reconnect')
+                self.running = False
+                if self.ws:
+                    await self.ws.close()
+                break
+        logger.info('Health check loop exited')
 
     async def message_loop(self):
         while self.running and self.ws:
             try:
                 message = await asyncio.wait_for(self.recv(), timeout=60)
+                self.last_server_response = time.time()  # Track server activity
                 msg_type = message.get('type', '')
 
                 if msg_type == 'request':
@@ -475,16 +511,28 @@ class TunnelClient:
                     asyncio.create_task(self.handle_ws_close(message))
                 elif msg_type == 'subdomain_changed':
                     self.handle_subdomain_changed(message)
+                elif msg_type == 'pong':
+                    pass  # Heartbeat response, connection is alive
+                elif msg_type == 'ping':
+                    # Server is checking if we're alive - respond with pong
+                    await self.send({'type': 'pong'})
                 elif msg_type == 'error':
-                    logger.error(f'Server: {message.get("error")}')
+                    logger.error(f'Server error: {message.get("error")}')
 
             except asyncio.TimeoutError:
-                await self.send({'type': 'heartbeat'})
-            except websockets.exceptions.ConnectionClosed:
+                # No message for 60 seconds - send heartbeat to check connection
+                try:
+                    await self.send({'type': 'heartbeat'})
+                except Exception as e:
+                    logger.warning(f'Connection dead (heartbeat failed): {e}')
+                    break
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f'Connection closed (code={e.code}, reason={e.reason})')
                 break
             except Exception as e:
-                logger.error(f'Error: {e}')
+                logger.error(f'Message loop error: {e}')
                 await asyncio.sleep(1)
+        logger.info('Message loop exited')
 
     async def handle_request(self, message: dict):
         request_id = message.get('request_id')
