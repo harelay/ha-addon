@@ -16,8 +16,9 @@ import os
 import signal
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 try:
     import aiohttp
@@ -42,19 +43,22 @@ HA_WS_URL = 'ws://localhost:8123'
 # Template directory
 TEMPLATE_DIR = Path(__file__).parent / 'templates'
 
-# Template cache
+# Template cache (loaded once at startup)
 _template_cache: dict[str, str] = {}
+_template_cache_lock = asyncio.Lock()
 
-def load_template(name: str) -> str:
+
+async def load_template(name: str) -> str:
     """Load a template from file. Caches templates for performance."""
-    if name not in _template_cache:
-        template_path = TEMPLATE_DIR / f'{name}.html'
-        try:
-            _template_cache[name] = template_path.read_text()
-        except Exception as e:
-            logger.error(f'Failed to load template {name}: {e}')
-            _template_cache[name] = f'<html><body><h1>Error</h1><p>Template {name} not found</p></body></html>'
-    return _template_cache[name]
+    async with _template_cache_lock:
+        if name not in _template_cache:
+            template_path = TEMPLATE_DIR / f'{name}.html'
+            try:
+                _template_cache[name] = template_path.read_text()
+            except Exception as e:
+                logger.error(f'Failed to load template {name}: {e}')
+                _template_cache[name] = f'<html><body><h1>Error</h1><p>Template {name} not found</p></body></html>'
+        return _template_cache[name]
 
 
 CREDENTIALS_FILE = Path('/data/credentials.json')
@@ -80,6 +84,8 @@ class HARelayAddon:
         self.user_code = None
         self.code_expires_at = 0
         self.running = True
+        self._tunnel_task: asyncio.Task | None = None
+        self._pairing_task: asyncio.Task | None = None
 
         logger.info(f'Server URL: {self.server_url}')
         logger.info(f'Configured: {self.is_configured}')
@@ -117,7 +123,7 @@ class HARelayAddon:
         if not self.is_configured:
             # Don't auto-start pairing if user manually unlinked
             if self.status not in ('pairing', 'error', 'unlinked'):
-                asyncio.create_task(self.start_pairing())
+                self._start_pairing_task()
             # Show unlinked page if manually unlinked
             if self.status == 'unlinked':
                 return await self.handle_unlinked_page(request)
@@ -134,7 +140,7 @@ class HARelayAddon:
 
         expires_in = max(0, int(self.code_expires_at - time.time()))
 
-        html = load_template('pairing')
+        html = await load_template('pairing')
         html = html.replace('{{USER_CODE}}', self.user_code or 'Loading...')
         html = html.replace('{{VERIFICATION_URL}}', f'{self.server_url}/link')
         html = html.replace('{{EXPIRES_IN}}', str(expires_in))
@@ -143,7 +149,7 @@ class HARelayAddon:
 
     async def handle_unlinked_page(self, request: web.Request) -> web.Response:
         """Show unlinked page with option to start pairing."""
-        html = load_template('unlinked')
+        html = await load_template('unlinked')
         return web.Response(text=html, content_type='text/html')
 
     async def handle_status_page(self, request: web.Request) -> web.Response:
@@ -161,7 +167,7 @@ class HARelayAddon:
             status_class, emoji, title = 'disconnected', '✗', 'Disconnected'
             subtitle = self.status_message or 'Tunnel is not connected'
 
-        html = load_template('status')
+        html = await load_template('status')
         html = html.replace('{{STATUS_CLASS}}', status_class)
         html = html.replace('{{STATUS_EMOJI}}', emoji)
         html = html.replace('{{STATUS_TITLE}}', title)
@@ -191,6 +197,14 @@ class HARelayAddon:
 
     async def handle_api_unlink(self, request: web.Request) -> web.Response:
         """Clear credentials without starting re-pairing."""
+        # Cancel tunnel task if running
+        if self._tunnel_task and not self._tunnel_task.done():
+            self._tunnel_task.cancel()
+            try:
+                await self._tunnel_task
+            except asyncio.CancelledError:
+                pass
+
         self._save_credentials('', '')
         self.subdomain = ''
         self.token = ''
@@ -201,13 +215,33 @@ class HARelayAddon:
 
     async def handle_api_relink(self, request: web.Request) -> web.Response:
         """Reset credentials and start re-pairing."""
+        # Cancel tunnel task if running
+        if self._tunnel_task and not self._tunnel_task.done():
+            self._tunnel_task.cancel()
+            try:
+                await self._tunnel_task
+            except asyncio.CancelledError:
+                pass
+
         self._save_credentials('', '')
         self.subdomain = ''
         self.token = ''
         self.status = 'pairing'
         self.user_code = None
-        asyncio.create_task(self.start_pairing())
+        self._start_pairing_task()
         return web.json_response({'ok': True})
+
+    def _start_pairing_task(self):
+        """Start pairing task, cancelling any existing one."""
+        if self._pairing_task and not self._pairing_task.done():
+            self._pairing_task.cancel()
+        self._pairing_task = asyncio.create_task(self.start_pairing())
+
+    def _start_tunnel_task(self):
+        """Start tunnel task, cancelling any existing one."""
+        if self._tunnel_task and not self._tunnel_task.done():
+            self._tunnel_task.cancel()
+        self._tunnel_task = asyncio.create_task(self.run_tunnel())
 
     # ==================== Pairing ====================
 
@@ -255,6 +289,8 @@ class HARelayAddon:
                                 self.status = 'error'
                                 self.status_message = f'Server returned {resp.status}'
                                 return
+                    except asyncio.CancelledError:
+                        raise
                     except aiohttp.ClientError as e:
                         logger.error(f'Failed to connect: {e}')
                         if attempt < max_retries - 1:
@@ -301,17 +337,22 @@ class HARelayAddon:
                             self.token = data['token']
                             self._save_credentials(self.subdomain, self.token)
                             self.status = 'connecting'
-                            asyncio.create_task(self.run_tunnel())
+                            self._start_tunnel_task()
                             return
 
                         if data.get('status') == 'expired':
                             self.status = 'expired'
                             return
 
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
                         pass
 
                 self.status = 'expired'
+        except asyncio.CancelledError:
+            logger.info('Pairing cancelled')
+            raise
         except Exception as e:
             logger.error(f'Pairing error: {e}')
             self.status = 'error'
@@ -335,16 +376,24 @@ class HARelayAddon:
                 on_subdomain_changed=self._on_subdomain_changed
             )
 
-            if await tunnel.connect():
-                self.status = 'connected'
-                logger.info(f'Connected - https://{self.subdomain}.harelay.com')
-                await tunnel.run()
-                self.status = 'disconnected'
-                self.status_message = 'Connection lost'
-            else:
-                self.status = 'disconnected'
-                self.status_message = tunnel.last_error or 'Connection failed'
+            try:
+                if await tunnel.connect():
+                    self.status = 'connected'
+                    logger.info(f'Connected - https://{self.subdomain}.harelay.com')
+                    await tunnel.run()
+                    self.status = 'disconnected'
+                    self.status_message = 'Connection lost'
+                else:
+                    self.status = 'disconnected'
+                    self.status_message = tunnel.last_error or 'Connection failed'
+            except asyncio.CancelledError:
+                logger.info('Tunnel cancelled')
+                await tunnel.shutdown()
+                raise
+            finally:
+                await tunnel.shutdown()
 
+            # Only reconnect if still running
             if self.running and self.is_configured:
                 logger.info('Reconnecting in 5 seconds...')
                 await asyncio.sleep(5)
@@ -370,19 +419,74 @@ class HARelayAddon:
         # Start tunnel if configured, otherwise start pairing
         if self.is_configured:
             self.status = 'connecting'
-            asyncio.create_task(self.run_tunnel())
+            self._start_tunnel_task()
         else:
-            asyncio.create_task(self.start_pairing())
+            self._start_pairing_task()
 
         # Keep running
-        while self.running:
-            await asyncio.sleep(1)
-
-        await runner.cleanup()
+        try:
+            while self.running:
+                await asyncio.sleep(1)
+        finally:
+            # Clean shutdown
+            if self._tunnel_task and not self._tunnel_task.done():
+                self._tunnel_task.cancel()
+                try:
+                    await self._tunnel_task
+                except asyncio.CancelledError:
+                    pass
+            if self._pairing_task and not self._pairing_task.done():
+                self._pairing_task.cancel()
+                try:
+                    await self._pairing_task
+                except asyncio.CancelledError:
+                    pass
+            await runner.cleanup()
 
     def stop(self):
         logger.info('Shutting down...')
         self.running = False
+
+
+class LRUCache:
+    """Simple LRU cache with size tracking."""
+
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.cache: OrderedDict[str, tuple[int, dict, bytes]] = OrderedDict()
+        self.current_size = 0
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> tuple[int, dict, bytes] | None:
+        async with self._lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            return None
+
+    async def put(self, key: str, value: tuple[int, dict, bytes]):
+        async with self._lock:
+            item_size = len(value[2])
+
+            # Don't cache items larger than max size
+            if item_size > self.max_size:
+                return
+
+            # Remove existing entry if present
+            if key in self.cache:
+                old_size = len(self.cache[key][2])
+                self.current_size -= old_size
+                del self.cache[key]
+
+            # Evict LRU entries until we have space
+            while self.current_size + item_size > self.max_size and self.cache:
+                oldest_key, oldest_value = self.cache.popitem(last=False)
+                self.current_size -= len(oldest_value[2])
+
+            # Add new entry
+            self.cache[key] = value
+            self.current_size += item_size
 
 
 class TunnelClient:
@@ -402,13 +506,16 @@ class TunnelClient:
         self.on_subdomain_changed = on_subdomain_changed
         self.ws = None
         self.running = True
-        self.ws_streams = {}
-        self.ws_pending = {}
+        self.ws_streams: dict[str, websockets.WebSocketClientProtocol] = {}
+        self.ws_pending: dict[str, list[str]] = {}
+        self._ws_locks: dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()  # Lock for creating stream locks
         self.last_error = None
-        self.http_connector = None  # Shared connector, per-request sessions
-        self.last_server_response = time.time()  # Track last message from server
-        self.static_cache = {}  # uri -> (status_code, headers, body_bytes)
-        self.static_cache_size = 0  # Track total cache size
+        self.http_connector: aiohttp.TCPConnector | None = None
+        self.last_server_response = time.time()
+        self.static_cache = LRUCache(self.CACHE_MAX_SIZE)
+        self._shutdown_event = asyncio.Event()
+        self._active_tasks: set[asyncio.Task] = set()
 
     def get_ws_url(self) -> str:
         """Get WebSocket URL for tunnel connection."""
@@ -428,6 +535,8 @@ class TunnelClient:
 
             self.last_error = response.get('error', 'Auth failed')
             return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self.last_error = str(e)
             return False
@@ -440,13 +549,50 @@ class TunnelClient:
         data = await self.ws.recv()
         return json.loads(data)
 
+    async def shutdown(self):
+        """Gracefully shutdown all connections."""
+        self.running = False
+        self._shutdown_event.set()
+
+        # Cancel all active tasks
+        for task in list(self._active_tasks):
+            task.cancel()
+
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+        self._active_tasks.clear()
+
+        # Close all WebSocket streams
+        for stream_id, ws in list(self.ws_streams.items()):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self.ws_streams.clear()
+        self.ws_pending.clear()
+        self._ws_locks.clear()
+
+        # Close main WebSocket
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+
+        # Close HTTP connector
+        if self.http_connector:
+            await self.http_connector.close()
+            self.http_connector = None
+
     async def run(self):
-        # Shared connector but each request validates its response
         self.http_connector = aiohttp.TCPConnector(
             limit=100,
             limit_per_host=100,
         )
-        self.last_server_response = time.time()  # Reset on new connection
+        self.last_server_response = time.time()
+        self._shutdown_event.clear()
+
         try:
             results = await asyncio.gather(
                 self.heartbeat_loop(),
@@ -457,31 +603,30 @@ class TunnelClient:
             # Log any exceptions that occurred
             loop_names = ['heartbeat_loop', 'message_loop', 'health_check_loop']
             for i, result in enumerate(results):
-                if isinstance(result, Exception):
+                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                     logger.error(f'{loop_names[i]} exited with error: {result}')
-        finally:
-            for ws in list(self.ws_streams.values()):
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-            self.ws_streams.clear()
-            if self.ws:
-                try:
-                    await self.ws.close()
-                except Exception:
-                    pass
-            if self.http_connector:
-                await self.http_connector.close()
+        except asyncio.CancelledError:
+            logger.info('Tunnel run cancelled')
+            raise
 
     async def heartbeat_loop(self):
         while self.running and self.ws:
             try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=30
+                )
+                break  # Shutdown requested
+            except asyncio.TimeoutError:
+                pass  # Normal timeout, send heartbeat
+
+            try:
                 await self.send({'type': 'heartbeat'})
-                await asyncio.sleep(30)  # Heartbeat every 30 seconds
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f'Heartbeat: connection closed (code={e.code}, reason={e.reason})')
                 break
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f'Heartbeat error: {e}')
                 break
@@ -490,13 +635,24 @@ class TunnelClient:
     async def health_check_loop(self):
         """Monitor connection health and force reconnect if server stops responding."""
         while self.running and self.ws:
-            await asyncio.sleep(10)  # Check every 10 seconds
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=10
+                )
+                break  # Shutdown requested
+            except asyncio.TimeoutError:
+                pass  # Normal timeout, check health
+
             time_since_response = time.time() - self.last_server_response
             if time_since_response > self.HEALTH_CHECK_TIMEOUT:
                 logger.warning(f'Connection unhealthy: no server response for {time_since_response:.0f}s, forcing reconnect')
                 self.running = False
                 if self.ws:
-                    await self.ws.close()
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
                 break
         logger.info('Health check loop exited')
 
@@ -504,34 +660,44 @@ class TunnelClient:
         while self.running and self.ws:
             try:
                 message = await asyncio.wait_for(self.recv(), timeout=60)
-                self.last_server_response = time.time()  # Track server activity
+                self.last_server_response = time.time()
                 msg_type = message.get('type', '')
 
                 if msg_type == 'request':
-                    asyncio.create_task(self.handle_request(message))
+                    task = asyncio.create_task(self.handle_request(message))
+                    self._active_tasks.add(task)
+                    task.add_done_callback(self._active_tasks.discard)
                 elif msg_type == 'ws_open':
-                    asyncio.create_task(self.handle_ws_open(message))
+                    task = asyncio.create_task(self.handle_ws_open(message))
+                    self._active_tasks.add(task)
+                    task.add_done_callback(self._active_tasks.discard)
                 elif msg_type == 'ws_message':
-                    asyncio.create_task(self.handle_ws_message(message))
+                    task = asyncio.create_task(self.handle_ws_message(message))
+                    self._active_tasks.add(task)
+                    task.add_done_callback(self._active_tasks.discard)
                 elif msg_type == 'ws_close':
-                    asyncio.create_task(self.handle_ws_close(message))
+                    task = asyncio.create_task(self.handle_ws_close(message))
+                    self._active_tasks.add(task)
+                    task.add_done_callback(self._active_tasks.discard)
                 elif msg_type == 'subdomain_changed':
                     self.handle_subdomain_changed(message)
                 elif msg_type == 'pong':
                     pass  # Heartbeat response, connection is alive
                 elif msg_type == 'ping':
-                    # Server is checking if we're alive - respond with pong
                     await self.send({'type': 'pong'})
                 elif msg_type == 'error':
                     logger.error(f'Server error: {message.get("error")}')
 
             except asyncio.TimeoutError:
-                # No message for 60 seconds - send heartbeat to check connection
                 try:
                     await self.send({'type': 'heartbeat'})
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.warning(f'Connection dead (heartbeat failed): {e}')
                     break
+            except asyncio.CancelledError:
+                raise
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f'Connection closed (code={e.code}, reason={e.reason})')
                 break
@@ -553,11 +719,9 @@ class TunnelClient:
             body = body.encode()
 
         url = urljoin(HA_HTTP_URL, uri)
-        # Filter out headers that shouldn't be forwarded
         skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
         filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
 
-        # Handle authorization
         if not uri.startswith('/auth/'):
             original_auth = headers.get('Authorization') or headers.get('authorization')
             if original_auth:
@@ -565,24 +729,23 @@ class TunnelClient:
             elif self.supervisor_token:
                 filtered_headers['Authorization'] = f'Bearer {self.supervisor_token}'
 
-        # Check if this is a streaming endpoint (like /logs/follow)
         is_streaming = '/follow' in uri or headers.get('Accept') == 'text/event-stream'
-
-        # Check if this is a cacheable static file
         is_cacheable = method == 'GET' and any(uri.startswith(p) for p in self.CACHE_PATHS)
 
-        # Check cache first for static files
-        if is_cacheable and uri in self.static_cache:
-            status_code, response_headers, response_bytes = self.static_cache[uri]
-            logger.info(f'REQ CACHE HIT {uri}')
-            await self.send({
-                'type': 'response',
-                'request_id': request_id,
-                'status_code': status_code,
-                'headers': response_headers,
-                'body': base64.b64encode(response_bytes).decode('ascii')
-            })
-            return
+        # Check cache first
+        if is_cacheable:
+            cached = await self.static_cache.get(uri)
+            if cached:
+                status_code, response_headers, response_bytes = cached
+                logger.info(f'REQ CACHE HIT {uri}')
+                await self.send({
+                    'type': 'response',
+                    'request_id': request_id,
+                    'status_code': status_code,
+                    'headers': response_headers,
+                    'body': base64.b64encode(response_bytes).decode('ascii')
+                })
+                return
 
         logger.info(f'REQ START {uri}')
         status_code = None
@@ -592,13 +755,21 @@ class TunnelClient:
 
         for attempt in range(2):
             try:
-                # Create a fresh session for each request - shares connector but isolates state
                 async with aiohttp.ClientSession(connector=self.http_connector, connector_owner=False) as session:
                     if is_streaming:
                         timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
                         async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
                             status_code = resp.status
-                            response_headers = dict(resp.headers)
+                            # Convert headers, preserving multiple values (e.g., Set-Cookie)
+                            response_headers = {}
+                            for key, value in resp.headers.items():
+                                if key in response_headers:
+                                    if isinstance(response_headers[key], list):
+                                        response_headers[key].append(value)
+                                    else:
+                                        response_headers[key] = [response_headers[key], value]
+                                else:
+                                    response_headers[key] = value
                             chunks = []
                             total_size = 0
                             try:
@@ -615,8 +786,18 @@ class TunnelClient:
                         async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
                             status_code = resp.status
                             response_bytes = await resp.read()
-                            response_headers = dict(resp.headers)
-                break  # Success
+                            # Convert headers, preserving multiple values (e.g., Set-Cookie)
+                            response_headers = {}
+                            for key, value in resp.headers.items():
+                                if key in response_headers:
+                                    # Multiple values for same header - convert to list
+                                    if isinstance(response_headers[key], list):
+                                        response_headers[key].append(value)
+                                    else:
+                                        response_headers[key] = [response_headers[key], value]
+                                else:
+                                    response_headers[key] = value
+                break
 
             except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError,
                     aiohttp.ClientOSError, ConnectionResetError) as e:
@@ -625,12 +806,14 @@ class TunnelClient:
                     logger.warning(f'Request {uri} failed ({type(e).__name__}), retrying...')
                     await asyncio.sleep(0.05)
                     continue
-
             except asyncio.TimeoutError:
                 status_code = 504
                 response_bytes = b'Gateway Timeout'
                 response_headers = {'Content-Type': 'text/plain'}
                 break
+
+            except asyncio.CancelledError:
+                raise
 
             except Exception as e:
                 last_error = e
@@ -644,17 +827,8 @@ class TunnelClient:
 
         # Cache successful static file responses
         if is_cacheable and status_code == 200 and response_bytes:
-            file_size = len(response_bytes)
-            # Evict old entries if cache is too large
-            while self.static_cache_size + file_size > self.CACHE_MAX_SIZE and self.static_cache:
-                oldest_uri = next(iter(self.static_cache))
-                old_size = len(self.static_cache[oldest_uri][2])
-                del self.static_cache[oldest_uri]
-                self.static_cache_size -= old_size
-            # Add to cache
-            self.static_cache[uri] = (status_code, response_headers, response_bytes)
-            self.static_cache_size += file_size
-            logger.info(f'REQ CACHED {uri} ({file_size} bytes, cache: {self.static_cache_size // 1024}KB)')
+            await self.static_cache.put(uri, (status_code, response_headers, response_bytes))
+            logger.info(f'REQ CACHED {uri} ({len(response_bytes)} bytes)')
 
         logger.info(f'REQ DONE {uri} -> {status_code}')
         await self.send({
@@ -665,34 +839,107 @@ class TunnelClient:
             'body': base64.b64encode(response_bytes).decode('ascii')
         })
 
+    async def _get_stream_lock(self, stream_id: str) -> asyncio.Lock:
+        """Get or create a lock for a stream."""
+        async with self._locks_lock:
+            if stream_id not in self._ws_locks:
+                self._ws_locks[stream_id] = asyncio.Lock()
+            return self._ws_locks[stream_id]
+
     async def handle_ws_open(self, message: dict):
         stream_id = message.get('stream_id')
         path = message.get('path', '/api/websocket')
-        self.ws_pending[stream_id] = []
+        ingress_session = message.get('ingress_session')
+
+        lock = await self._get_stream_lock(stream_id)
+        async with lock:
+            self.ws_pending[stream_id] = []
 
         try:
-            # Don't send Authorization header - let the browser's auth flow work naturally
-            # The browser will send its access token through the WebSocket relay
-            # This ensures HA knows the user context, not just add-on context
-            ha_ws = await websockets.connect(f'{HA_WS_URL}{path}', ping_interval=20, ping_timeout=10)
-            self.ws_streams[stream_id] = ha_ws
-            for msg in self.ws_pending.pop(stream_id, []):
-                await ha_ws.send(msg)
-            asyncio.create_task(self.ws_stream_listener(stream_id, ha_ws))
+            if ingress_session:
+                logger.info(f'WS OPEN {path} (ingress, session={ingress_session[:20]}...)')
+
+                ws_headers = [('Cookie', f'ingress_session={ingress_session}')]
+
+                from websockets.extensions.permessage_deflate import ClientPerMessageDeflateFactory, PerMessageDeflate
+
+                class PermissiveDeflateFactory(ClientPerMessageDeflateFactory):
+                    def process_response_params(self, params, accepted_extensions):
+                        if not params:
+                            return PerMessageDeflate(
+                                remote_no_context_takeover=False,
+                                local_no_context_takeover=False,
+                                remote_max_window_bits=15,
+                                local_max_window_bits=15,
+                            )
+                        return super().process_response_params(params, accepted_extensions)
+
+                ha_ws = await websockets.connect(
+                    f'{HA_WS_URL}{path}',
+                    additional_headers=ws_headers,
+                    extensions=[PermissiveDeflateFactory()],
+                )
+                logger.info(f'WS CONNECTED {path} (ingress)')
+            else:
+                ha_ws = await websockets.connect(
+                    f'{HA_WS_URL}{path}',
+                    ping_interval=20,
+                    ping_timeout=10
+                )
+                logger.info(f'WS CONNECTED {path}')
+
+            async with lock:
+                self.ws_streams[stream_id] = ha_ws
+                pending = self.ws_pending.pop(stream_id, [])
+
+            # Start listener
+            task = asyncio.create_task(self.ws_stream_listener(stream_id, ha_ws))
+            self._active_tasks.add(task)
+            task.add_done_callback(self._active_tasks.discard)
+
+            # Send pending messages
+            if pending:
+                logger.info(f'WS SENDING {len(pending)} pending messages')
+                for msg in pending:
+                    await ha_ws.send(msg)
+
+        except asyncio.CancelledError:
+            # Clean up on cancellation
+            async with lock:
+                self.ws_pending.pop(stream_id, None)
+            async with self._locks_lock:
+                self._ws_locks.pop(stream_id, None)
+            raise
         except Exception as e:
-            self.ws_pending.pop(stream_id, None)
+            logger.error(f'WS OPEN FAILED {path}: {e}')
+            async with lock:
+                self.ws_pending.pop(stream_id, None)
+            async with self._locks_lock:
+                self._ws_locks.pop(stream_id, None)
             await self.send({'type': 'ws_closed', 'stream_id': stream_id, 'error': str(e)})
 
     async def ws_stream_listener(self, stream_id: str, ha_ws):
         try:
+            msg_count = 0
             async for message in ha_ws:
+                msg_count += 1
                 if stream_id not in self.ws_streams:
+                    logger.warning(f'WS LISTENER {stream_id[:8]}: stream removed, stopping')
                     break
                 await self.send({'type': 'ws_message', 'stream_id': stream_id, 'message': message})
-        except Exception:
-            pass
+            logger.info(f'WS LISTENER {stream_id[:8]}: closed after {msg_count} msgs, code={ha_ws.close_code}, reason={ha_ws.close_reason}')
+        except asyncio.CancelledError:
+            logger.info(f'WS LISTENER {stream_id[:8]}: cancelled')
+            raise
+        except Exception as e:
+            logger.error(f'WS LISTENER {stream_id[:8]}: error: {e}')
         finally:
-            self.ws_streams.pop(stream_id, None)
+            lock = await self._get_stream_lock(stream_id)
+            async with lock:
+                self.ws_streams.pop(stream_id, None)
+            # Clean up the lock
+            async with self._locks_lock:
+                self._ws_locks.pop(stream_id, None)
             try:
                 await self.send({'type': 'ws_closed', 'stream_id': stream_id})
             except Exception:
@@ -701,22 +948,37 @@ class TunnelClient:
     async def handle_ws_message(self, message: dict):
         stream_id = message.get('stream_id')
         ws_message = message.get('message', '')
-        if stream_id in self.ws_streams:
-            try:
-                await self.ws_streams[stream_id].send(ws_message)
-            except Exception:
-                pass
-        elif stream_id in self.ws_pending:
-            self.ws_pending[stream_id].append(ws_message)
+
+        lock = await self._get_stream_lock(stream_id)
+        async with lock:
+            if stream_id in self.ws_streams:
+                try:
+                    ws = self.ws_streams[stream_id]
+                    await ws.send(ws_message)
+                except Exception as e:
+                    logger.error(f'WS MSG SEND FAILED {stream_id[:8]}: {e}')
+            elif stream_id in self.ws_pending:
+                self.ws_pending[stream_id].append(ws_message)
+            else:
+                logger.warning(f'WS MSG DROPPED {stream_id[:8]}: no stream or pending')
 
     async def handle_ws_close(self, message: dict):
         stream_id = message.get('stream_id')
-        self.ws_pending.pop(stream_id, None)
-        if stream_id in self.ws_streams:
+
+        lock = await self._get_stream_lock(stream_id)
+        async with lock:
+            self.ws_pending.pop(stream_id, None)
+            ws = self.ws_streams.pop(stream_id, None)
+
+        if ws:
             try:
-                await self.ws_streams.pop(stream_id).close()
+                await ws.close()
             except Exception:
                 pass
+
+        # Clean up lock (synchronized)
+        async with self._locks_lock:
+            self._ws_locks.pop(stream_id, None)
 
     def handle_subdomain_changed(self, message: dict):
         """Handle subdomain change notification from server."""
@@ -726,7 +988,6 @@ class TunnelClient:
 
         self.subdomain = new_subdomain
 
-        # Update saved credentials
         try:
             CREDENTIALS_FILE.write_text(json.dumps({
                 'subdomain': new_subdomain,
@@ -736,7 +997,6 @@ class TunnelClient:
         except Exception as e:
             logger.error(f'Failed to save updated credentials: {e}')
 
-        # Notify parent (HARelayAddon) of the change
         if self.on_subdomain_changed:
             self.on_subdomain_changed(new_subdomain)
 
@@ -753,13 +1013,13 @@ def load_config() -> dict:
 
 
 async def main():
-    logger.info('HARelay Add-on starting... (v8-cache)')
+    logger.info('HARelay Add-on starting')
     config = load_config()
     logger.info(f'Config loaded: {list(config.keys())}')
 
     addon = HARelayAddon(config)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, addon.stop)
 
