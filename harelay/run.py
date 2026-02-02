@@ -446,7 +446,7 @@ class TunnelClient:
         )
         self.http_session = aiohttp.ClientSession(
             connector=connector,
-            auto_decompress=True,   # Handle gzip automatically
+            auto_decompress=False,  # Don't decompress - we validate Content-Length
         )
         self.last_server_response = time.time()  # Reset on new connection
         try:
@@ -558,6 +558,8 @@ class TunnelClient:
         # Filter out headers that shouldn't be forwarded
         skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
         filtered_headers = {k: v for k, v in headers.items() if k.lower() not in skip_headers}
+        # Request uncompressed responses so we can validate Content-Length
+        filtered_headers['Accept-Encoding'] = 'identity'
 
         # Handle authorization
         if not uri.startswith('/auth/'):
@@ -607,18 +609,14 @@ class TunnelClient:
                         response_headers = dict(resp.headers)
 
                         # Validate response integrity - detect corruption
-                        # Skip if response was compressed (Content-Length is compressed size,
-                        # but body is decompressed by aiohttp)
-                        content_encoding = resp.headers.get('Content-Encoding', '').lower()
-                        if not content_encoding:  # Only validate uncompressed responses
-                            content_length = resp.headers.get('Content-Length')
-                            if content_length:
-                                expected = int(content_length)
-                                actual = len(response_bytes)
-                                if expected != actual:
-                                    raise aiohttp.ClientPayloadError(
-                                        f'Content-Length mismatch: expected {expected}, got {actual}'
-                                    )
+                        content_length = resp.headers.get('Content-Length')
+                        if content_length:
+                            expected = int(content_length)
+                            actual = len(response_bytes)
+                            if expected != actual:
+                                raise aiohttp.ClientPayloadError(
+                                    f'Content-Length mismatch: expected {expected}, got {actual}'
+                                )
 
                 # Success - send response
                 await self.send({
