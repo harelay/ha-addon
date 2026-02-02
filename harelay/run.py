@@ -614,8 +614,10 @@ class TunnelClient:
         self.ws_pending[stream_id] = []
 
         try:
-            headers = {'Authorization': f'Bearer {self.supervisor_token}'} if self.supervisor_token else {}
-            ha_ws = await websockets.connect(f'{HA_WS_URL}{path}', additional_headers=headers, ping_interval=20, ping_timeout=10)
+            # Don't send Authorization header - let the browser's auth flow work naturally
+            # The browser will send its access token through the WebSocket relay
+            # This ensures HA knows the user context, not just add-on context
+            ha_ws = await websockets.connect(f'{HA_WS_URL}{path}', ping_interval=20, ping_timeout=10)
             self.ws_streams[stream_id] = ha_ws
             for msg in self.ws_pending.pop(stream_id, []):
                 await ha_ws.send(msg)
