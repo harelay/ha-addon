@@ -6,7 +6,8 @@ RUN apk add --no-cache \
     python3 \
     py3-pip \
     py3-aiohttp \
-    py3-websockets
+    py3-websockets \
+    py3-msgpack
 
 # Copy application
 COPY rootfs /

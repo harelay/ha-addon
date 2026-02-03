@@ -9,7 +9,6 @@ Features:
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -29,12 +28,49 @@ except ImportError:
 
 try:
     import websockets
+    from websockets.extensions.permessage_deflate import ClientPerMessageDeflateFactory, PerMessageDeflate
 except ImportError:
     print("ERROR: websockets not installed")
     sys.exit(1)
 
+# MessagePack for binary protocol
+import msgpack
+
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+
+class PermissiveDeflateFactory(ClientPerMessageDeflateFactory):
+    """
+    Permissive permessage-deflate factory for HA ingress WebSockets.
+    HA's ingress system has quirks with deflate negotiation - this handles them gracefully.
+    """
+    def process_response_params(self, params, accepted_extensions):
+        if not params:
+            return PerMessageDeflate(
+                remote_no_context_takeover=False,
+                local_no_context_takeover=False,
+                remote_max_window_bits=15,
+                local_max_window_bits=15,
+            )
+        return super().process_response_params(params, accepted_extensions)
+
+
+def extract_response_headers(resp) -> dict:
+    """
+    Extract headers from aiohttp response, preserving multiple values.
+    aiohttp's dict(resp.headers) loses duplicate headers like Set-Cookie.
+    """
+    headers = {}
+    for key, value in resp.headers.items():
+        if key in headers:
+            if isinstance(headers[key], list):
+                headers[key].append(value)
+            else:
+                headers[key] = [headers[key], value]
+        else:
+            headers[key] = value
+    return headers
 
 # Home Assistant URLs
 HA_HTTP_URL = 'http://localhost:8123'
@@ -527,7 +563,11 @@ class TunnelClient:
 
         try:
             self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10)
+
+            # Send auth (MessagePack binary)
             await self.send({'type': 'auth', 'subdomain': self.subdomain, 'token': self.token})
+
+            # Wait for auth response
             response = await asyncio.wait_for(self.recv(), timeout=10)
 
             if response.get('type') == 'auth_result' and response.get('success'):
@@ -543,11 +583,11 @@ class TunnelClient:
 
     async def send(self, message: dict):
         if self.ws:
-            await self.ws.send(json.dumps(message))
+            await self.ws.send(msgpack.packb(message, use_bin_type=True))
 
     async def recv(self) -> dict:
         data = await self.ws.recv()
-        return json.loads(data)
+        return msgpack.unpackb(data, raw=False)
 
     async def shutdown(self):
         """Gracefully shutdown all connections."""
@@ -624,11 +664,13 @@ class TunnelClient:
                 await self.send({'type': 'heartbeat'})
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f'Heartbeat: connection closed (code={e.code}, reason={e.reason})')
+                self._shutdown_event.set()  # Wake up other loops
                 break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f'Heartbeat error: {e}')
+                self._shutdown_event.set()  # Wake up other loops
                 break
         logger.info('Heartbeat loop exited')
 
@@ -647,7 +689,7 @@ class TunnelClient:
             time_since_response = time.time() - self.last_server_response
             if time_since_response > self.HEALTH_CHECK_TIMEOUT:
                 logger.warning(f'Connection unhealthy: no server response for {time_since_response:.0f}s, forcing reconnect')
-                self.running = False
+                self._shutdown_event.set()  # Wake up other loops
                 if self.ws:
                     try:
                         await self.ws.close()
@@ -695,11 +737,13 @@ class TunnelClient:
                     raise
                 except Exception as e:
                     logger.warning(f'Connection dead (heartbeat failed): {e}')
+                    self._shutdown_event.set()  # Wake up other loops
                     break
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f'Connection closed (code={e.code}, reason={e.reason})')
+                self._shutdown_event.set()  # Wake up other loops
                 break
             except Exception as e:
                 logger.error(f'Message loop error: {e}')
@@ -713,10 +757,9 @@ class TunnelClient:
         headers = message.get('headers', {})
         body = message.get('body')
 
-        if body and message.get('body_encoded'):
-            body = base64.b64decode(body)
-        elif body:
-            body = body.encode()
+        # Body arrives as raw bytes from MessagePack
+        if body and not isinstance(body, bytes):
+            body = body.encode() if isinstance(body, str) else bytes(body)
 
         url = urljoin(HA_HTTP_URL, uri)
         skip_headers = {'host', 'content-length', 'transfer-encoding', 'accept-encoding'}
@@ -743,7 +786,7 @@ class TunnelClient:
                     'request_id': request_id,
                     'status_code': status_code,
                     'headers': response_headers,
-                    'body': base64.b64encode(response_bytes).decode('ascii')
+                    'body': response_bytes,  # Raw bytes
                 })
                 return
 
@@ -760,16 +803,7 @@ class TunnelClient:
                         timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
                         async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
                             status_code = resp.status
-                            # Convert headers, preserving multiple values (e.g., Set-Cookie)
-                            response_headers = {}
-                            for key, value in resp.headers.items():
-                                if key in response_headers:
-                                    if isinstance(response_headers[key], list):
-                                        response_headers[key].append(value)
-                                    else:
-                                        response_headers[key] = [response_headers[key], value]
-                                else:
-                                    response_headers[key] = value
+                            response_headers = extract_response_headers(resp)
                             chunks = []
                             total_size = 0
                             try:
@@ -786,17 +820,7 @@ class TunnelClient:
                         async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
                             status_code = resp.status
                             response_bytes = await resp.read()
-                            # Convert headers, preserving multiple values (e.g., Set-Cookie)
-                            response_headers = {}
-                            for key, value in resp.headers.items():
-                                if key in response_headers:
-                                    # Multiple values for same header - convert to list
-                                    if isinstance(response_headers[key], list):
-                                        response_headers[key].append(value)
-                                    else:
-                                        response_headers[key] = [response_headers[key], value]
-                                else:
-                                    response_headers[key] = value
+                            response_headers = extract_response_headers(resp)
                 break
 
             except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError,
@@ -836,7 +860,7 @@ class TunnelClient:
             'request_id': request_id,
             'status_code': status_code,
             'headers': response_headers,
-            'body': base64.b64encode(response_bytes).decode('ascii')
+            'body': response_bytes,  # Raw bytes
         })
 
     async def _get_stream_lock(self, stream_id: str) -> asyncio.Lock:
@@ -860,20 +884,6 @@ class TunnelClient:
                 logger.info(f'WS OPEN {path} (ingress, session={ingress_session[:20]}...)')
 
                 ws_headers = [('Cookie', f'ingress_session={ingress_session}')]
-
-                from websockets.extensions.permessage_deflate import ClientPerMessageDeflateFactory, PerMessageDeflate
-
-                class PermissiveDeflateFactory(ClientPerMessageDeflateFactory):
-                    def process_response_params(self, params, accepted_extensions):
-                        if not params:
-                            return PerMessageDeflate(
-                                remote_no_context_takeover=False,
-                                local_no_context_takeover=False,
-                                remote_max_window_bits=15,
-                                local_max_window_bits=15,
-                            )
-                        return super().process_response_params(params, accepted_extensions)
-
                 ha_ws = await websockets.connect(
                     f'{HA_WS_URL}{path}',
                     additional_headers=ws_headers,
