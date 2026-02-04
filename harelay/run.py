@@ -798,7 +798,11 @@ class TunnelClient:
 
         for attempt in range(2):
             try:
-                async with aiohttp.ClientSession(connector=self.http_connector, connector_owner=False) as session:
+                # IMPORTANT: auto_decompress=False keeps responses in original encoding.
+                # This ensures Content-Encoding header matches the actual body content.
+                # Without this, aiohttp decompresses gzip but headers still say "gzip",
+                # causing browsers to fail parsing JS modules.
+                async with aiohttp.ClientSession(connector=self.http_connector, connector_owner=False, auto_decompress=False) as session:
                     if is_streaming:
                         timeout = aiohttp.ClientTimeout(total=10, sock_read=3)
                         async with session.request(method=method, url=url, headers=filtered_headers, data=body, timeout=timeout, allow_redirects=False) as resp:
