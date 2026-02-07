@@ -23,5 +23,5 @@ RUN chmod a+x /run.sh
 # Expose ingress port
 EXPOSE 8099
 
-# Run the add-on
+# Run the app
 CMD [ "/run.sh" ]

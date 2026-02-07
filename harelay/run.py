@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HARelay Tunnel Client for Home Assistant Add-on
+HARelay Tunnel Client for Home Assistant App
 
 Features:
 - Web UI for device pairing (via ingress)
@@ -101,7 +101,7 @@ CREDENTIALS_FILE = Path('/data/credentials.json')
 
 
 class HARelayAddon:
-    """Main add-on class handling both web UI and tunnel."""
+    """Main app class handling both web UI and tunnel."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -198,7 +198,7 @@ class HARelayAddon:
             subtitle = 'Establishing tunnel connection'
         elif self.status == 'initializing':
             status_class, emoji, title = 'initializing spin', '⟳', 'Starting...'
-            subtitle = 'Initializing add-on, please wait'
+            subtitle = 'Initializing app, please wait'
         else:
             status_class, emoji, title = 'disconnected', '✗', 'Disconnected'
             subtitle = self.status_message or 'Tunnel is not connected'
@@ -220,7 +220,7 @@ class HARelayAddon:
         elif self.status == 'connecting':
             data = {'status': 'connecting', 'status_class': 'connecting pulse', 'emoji': '⟳', 'title': 'Connecting...', 'subtitle': 'Establishing tunnel connection'}
         elif self.status == 'initializing':
-            data = {'status': 'initializing', 'status_class': 'initializing spin', 'emoji': '⟳', 'title': 'Starting...', 'subtitle': 'Initializing add-on, please wait'}
+            data = {'status': 'initializing', 'status_class': 'initializing spin', 'emoji': '⟳', 'title': 'Starting...', 'subtitle': 'Initializing app, please wait'}
         elif self.status == 'pairing':
             data = {'status': 'pairing'}
         elif self.status == 'expired':
@@ -246,7 +246,7 @@ class HARelayAddon:
         self.token = ''
         self.status = 'unlinked'
         self.user_code = None
-        self.status_message = 'Device unlinked. Restart the add-on or click Relink to pair again.'
+        self.status_message = 'Device unlinked. Restart the app or click Relink to pair again.'
         return web.json_response({'ok': True})
 
     async def handle_api_relink(self, request: web.Request) -> web.Response:
@@ -437,7 +437,7 @@ class HARelayAddon:
     # ==================== Main ====================
 
     async def run(self):
-        """Start the add-on."""
+        """Start the app."""
         logger.info('Starting web server on port 8099...')
 
         app = web.Application()
@@ -1016,7 +1016,7 @@ class TunnelClient:
 
 
 def load_config() -> dict:
-    """Load add-on configuration."""
+    """Load app configuration."""
     options_path = Path('/data/options.json')
     if options_path.exists():
         try:
@@ -1027,7 +1027,7 @@ def load_config() -> dict:
 
 
 async def main():
-    logger.info('HARelay Add-on starting')
+    logger.info('HARelay App starting')
     config = load_config()
     logger.info(f'Config loaded: {list(config.keys())}')
 
