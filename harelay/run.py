@@ -73,8 +73,8 @@ def extract_response_headers(resp) -> dict:
     return headers
 
 # Home Assistant URLs
-HA_HTTP_URL = 'http://localhost:8123'
-HA_WS_URL = 'ws://localhost:8123'
+HA_HTTP_URL = 'http://127.0.0.1:8123'
+HA_WS_URL = 'ws://127.0.0.1:8123'
 
 # Template directory
 TEMPLATE_DIR = Path(__file__).parent / 'templates'
