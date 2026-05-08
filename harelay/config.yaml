@@ -1,6 +1,6 @@
 name: "HARelay"
 description: "Secure remote access to Home Assistant via HARelay"
-version: "1.5.3"
+version: "1.5.4"
 slug: "harelay"
 url: "https://harelay.com"
 

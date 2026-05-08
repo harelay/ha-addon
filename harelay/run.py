@@ -562,7 +562,12 @@ class TunnelClient:
         logger.info(f'Connecting to {ws_url}...')
 
         try:
-            self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10)
+            self.ws = await websockets.connect(
+                ws_url,
+                ping_interval=20,
+                ping_timeout=10,
+                max_size=32 * 1024 * 1024,
+            )
 
             # Send auth (MessagePack binary)
             await self.send({'type': 'auth', 'subdomain': self.subdomain, 'token': self.token})
@@ -790,7 +795,11 @@ class TunnelClient:
                 })
                 return
 
+        # Debug: log exact headers being sent to HA
         logger.info(f'REQ START {uri}')
+        for hk, hv in filtered_headers.items():
+            hv_str = str(hv)
+            logger.info(f'  HDR {hk}: {hv_str[:120]}{"..." if len(hv_str) > 120 else ""}')
         status_code = None
         response_bytes = None
         response_headers = None
@@ -858,6 +867,8 @@ class TunnelClient:
             await self.static_cache.put(uri, (status_code, response_headers, response_bytes))
             logger.info(f'REQ CACHED {uri} ({len(response_bytes)} bytes)')
 
+        if status_code == 400:
+            logger.warning(f'REQ 400 BODY: {response_bytes[:500] if response_bytes else "(empty)"}')
         logger.info(f'REQ DONE {uri} -> {status_code}')
         await self.send({
             'type': 'response',
@@ -892,13 +903,15 @@ class TunnelClient:
                     f'{HA_WS_URL}{path}',
                     additional_headers=ws_headers,
                     extensions=[PermissiveDeflateFactory()],
+                    max_size=32 * 1024 * 1024,
                 )
                 logger.info(f'WS CONNECTED {path} (ingress)')
             else:
                 ha_ws = await websockets.connect(
                     f'{HA_WS_URL}{path}',
                     ping_interval=20,
-                    ping_timeout=10
+                    ping_timeout=10,
+                    max_size=32 * 1024 * 1024,
                 )
                 logger.info(f'WS CONNECTED {path}')
 
